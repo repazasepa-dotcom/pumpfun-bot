@@ -1,23 +1,15 @@
-# keep_alive.py
-from flask import Flask, jsonify
+from flask import Flask
 from threading import Thread
-import os
 
-app = Flask(__name__)
+app = Flask('')
 
 @app.route('/')
 def home():
-    return os.environ.get("KEEP_ALIVE_MSG", "Pump.fun bot alive ✅")
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok"}), 200
+    return "✅ PumpFun Bot Alive"
 
 def run():
-    port = int(os.environ.get("PORT", 5000))
-    # non-production dev server is fine for Render small apps
-    app.run(host="0.0.0.0", port=port)
+    app.run(host='0.0.0.0', port=5000)
 
-def start():
-    t = Thread(target=run, daemon=True)
+def keep_alive():
+    t = Thread(target=run)
     t.start()
