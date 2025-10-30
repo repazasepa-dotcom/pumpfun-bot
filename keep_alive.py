@@ -1,16 +1,16 @@
+# keep_alive.py
 from flask import Flask
-import threading
+from threading import Thread
 
-app = Flask("keep_alive")
+app = Flask('')
 
-@app.route("/")
+@app.route('/')
 def home():
-    return "PumpFun Bot is alive ✅"
+    return "✅ Pump.fun Bot is alive!"
 
 def run():
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host='0.0.0.0', port=5000)
 
 def keep_alive():
-    # Run Flask app in a separate thread
-    t = threading.Thread(target=run)
+    t = Thread(target=run)
     t.start()
