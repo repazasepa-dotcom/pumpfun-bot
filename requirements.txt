@@ -1,4 +1,6 @@
+telethon
+flask
 requests
-Flask
-python-dotenv
-snscrape   # optional; if this fails in environment you can remove it and rely on Dexscreener
+aiohttp
+beautifulsoup4
+pandas
