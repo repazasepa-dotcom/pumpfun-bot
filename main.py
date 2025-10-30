@@ -1,10 +1,11 @@
-import os, asyncio, aiohttp
+import os, asyncio, aiohttp, re
 from telethon import TelegramClient
 from keep_alive import keep_alive
+from bs4 import BeautifulSoup
 
 # Start keep-alive web server
 keep_alive()
-print("✅ Bot online + Keep alive started")
+print("✅ Bot started + Keep alive running")
 
 # ENV VARS
 API_ID = int(os.getenv("API_ID"))
@@ -15,45 +16,39 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "20"))
 
 client = TelegramClient('pumpfun', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# ✅ Pump.fun API endpoint
-async def fetch_pumpfun():
-    url = "https://frontend-api.pump.fun/coins/leaderboard?sort=created&timeRange=1h&limit=50"
+BASE_URL = "https://pump.fun/coins/leaderboard?sort=created&timeRange=1h&limit=50"
+
+async def fetch_html(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as r:
-            try:
-                return await r.json()
-            except:
-                return []
+            return await r.text()
 
-# ✅ Monitor coins (post every coin)
+def has_buy_sell(html):
+    """Check if the coin has both buy and sell transactions"""
+    soup = BeautifulSoup(html, "html.parser")
+    buy = soup.find_all(text=re.compile("buy", re.I))
+    sell = soup.find_all(text=re.compile("sell", re.I))
+    return len(buy) > 0 and len(sell) > 0
+
 async def monitor():
     seen = set()
-
     while True:
         try:
-            data = await fetch_pumpfun()
-            if not data:
-                print("⚠️ No data returned from Pump.fun API")
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
+            html = await fetch_html(BASE_URL)
+            tokens = re.findall(r'"mint":"(.*?)".*?"symbol":"(.*?)"', html)
 
-            # Post every coin
-            tokens = [(x["mint"], x["symbol"]) for x in data if "mint" in x and "symbol" in x]
-
-            for mint, symbol in tokens:
-                if mint in seen: 
+            for mint, symbol in tokens[:20]:  # limit 20 coins per scan
+                if mint in seen:
                     continue
                 seen.add(mint)
 
-                message = (
-                    f"🔥 *New Pump.fun Meme Coin*\n"
-                    f"💠 Symbol: `{symbol}`\n"
-                    f"🧬 Mint: `{mint}`\n"
-                    f"🔗 https://pump.fun/{mint}"
-                )
+                coin_url = f"https://pump.fun/{mint}"
+                coin_html = await fetch_html(coin_url)
 
-                await client.send_message(TELEGRAM_CHAT, message, parse_mode="md")
-                print(f"✅ Posted {symbol}")
+                if has_buy_sell(coin_html):
+                    msg = f"🔥 Active Coin\n💠 {symbol}\n🧬 Mint: {mint}\n🔗 {coin_url}"
+                    await client.send_message(TELEGRAM_CHAT, msg)
+                    print(f"✅ Posted: {symbol}")
 
         except Exception as e:
             print("⚠️ Error:", e)
