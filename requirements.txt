@@ -1,3 +1,4 @@
-telethon==1.33.0
-requests==2.32.3
-flask==3.0.0
+requests
+Flask
+python-dotenv
+snscrape   # optional; if this fails in environment you can remove it and rely on Dexscreener
