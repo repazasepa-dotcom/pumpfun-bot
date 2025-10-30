@@ -1,45 +1,54 @@
-import os, asyncio, aiohttp, re
+import os, asyncio, aiohttp, json, re
 from telethon import TelegramClient
 from keep_alive import keep_alive
 
-# Start keep-alive web server
+# Start keep-alive server (for Render / Replit)
 keep_alive()
-print("✅ Bot online + Keep alive started")
+print("✅ Bot started + keep-alive running")
 
-# ENV VARS
+# Environment variables
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "20"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 LOWCAP_THRESHOLD_MC = int(os.getenv("LOWCAP_THRESHOLD_MC", "5000"))
 
-client = TelegramClient('pumpfun', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+client = TelegramClient("pumpfun", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-X_KEYWORDS = ["pump", "moon", "viral", "sol", "memecoin", "trending", "🐸", "🚀"]
+# X trend keywords
+X_KEYWORDS = ["pump", "moon", "sol", "memecoin", "crypto", "trending", "🐸", "🚀"]
 
-# ✅ Pump.fun official API endpoint
+# ✅ Get live new coins from pumpportal
 async def fetch_pumpfun():
-    url = "https://frontend-api.pump.fun/coins/leaderboard?sort=created&timeRange=1h&limit=50"
+    url = "https://pumpportal.fun/api/data/all_coins"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Referer": "https://pump.fun"
+    }
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as r:
+        async with session.get(url, headers=headers) as r:
             try:
                 return await r.json()
             except:
                 return []
 
-# ✅ Basic honeypot text filter (upgradeable later)
-def is_honeypot(text):
-    blocked = ["max sell", "cannot sell", "trapped", "no sell", "dev control", "rug"]
-    return any(b in text.lower() for b in blocked)
+# ✅ Simple honeypot screening (can upgrade later)
+def is_honeypot(name):
+    block = ["max sell", "cannot sell", "no sell", "trap", "rug"]
+    return any(b in name.lower() for b in block)
 
-# ✅ X hype check (Nitter)
-async def check_x_hype(name):
-    url = f"https://nitter.net/search?f=tweets&q={name}+sol"
+# ✅ Check hype on X via Nitter
+async def check_x(symbol):
+    url = f"https://nitter.net/search?f=tweets&q={symbol}+sol"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as r:
-            t = await r.text()
-            return any(k in t.lower() for k in X_KEYWORDS)
+        try:
+            async with session.get(url) as r:
+                text = await r.text()
+                return any(k in text.lower() for k in X_KEYWORDS)
+        except:
+            return False
 
 async def monitor():
     seen = set()
@@ -47,45 +56,47 @@ async def monitor():
     while True:
         try:
             data = await fetch_pumpfun()
-            if not data:
-                print("⚠️ No data returned from Pump.fun API")
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
 
-            # Token list (mint + symbol)
-            tokens = [(x["mint"], x["symbol"]) for x in data if "mint" in x and "symbol" in x]
+            # Only take top 20 recent
+            tokens = data[:20]
 
-            for mint, symbol in tokens[:15]:
-                if mint in seen: 
+            for coin in tokens:
+                mint = coin.get("mint")
+                symbol = coin.get("symbol") or "UNKNOWN"
+
+                if not mint or mint in seen:
                     continue
+
                 seen.add(mint)
 
-                # Placeholder market cap (when no Birdeye key)
+                # Placeholder MC (You can add Birdeye API later)
                 mc = 3000  
 
-                desc = f"{symbol} launched on pump.fun"
-                if is_honeypot(desc):
-                    print(f"❌ Honeypot filter triggered: {symbol}")
+                hype = await check_x(symbol)
+
+                # Skip obvious rugs
+                if is_honeypot(symbol):
+                    print(f"⛔ Rug filter: {symbol}")
                     continue
 
-                hype = await check_x_hype(symbol)
-                
-                message = (
-                    f"🔥 *New Pump.fun Meme Coin*\n"
+                msg = (
+                    f"🔥 *NEW PUMP.FUN MEME*\n"
                     f"💠 Symbol: `{symbol}`\n"
                     f"🧬 Mint: `{mint}`\n"
-                    f"💰 MC Estimate: ~${mc}\n"
-                    f"📈 X Hype: {'✅ Active buzz' if hype else '❌ None'}\n"
+                    f"💰 MC: ~${mc}\n"
+                    f"📈 X Buzz: {'✅ Active' if hype else '❌ None yet'}\n"
                     f"🔗 https://pump.fun/{mint}"
                 )
 
+                # Conditions to post
                 if mc < LOWCAP_THRESHOLD_MC or hype:
-                    await client.send_message(TELEGRAM_CHAT, message, parse_mode="md")
-                    print(f"✅ Posted {symbol}")
+                    await client.send_message(TELEGRAM_CHAT, msg, parse_mode="md")
+                    print(f"✅ Posted: {symbol}")
 
         except Exception as e:
             print("⚠️ Error:", e)
 
+        print("⏳ Scanning new coins...")
         await asyncio.sleep(POLL_INTERVAL)
 
 async def main():
