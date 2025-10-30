@@ -1,1 +1,8 @@
-
+telethon
+requests
+flask
+python-dotenv
+snscrape
+gunicorn
+psutil
+rich
