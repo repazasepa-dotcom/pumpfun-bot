@@ -1,6 +1,4 @@
-telethon
-flask
-requests
+telethon==1.41.2
 aiohttp
-beautifulsoup4
-pandas
+Flask
+requests
