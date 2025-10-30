@@ -1,21 +1,15 @@
-# keep_alive.py
-from flask import Flask, jsonify
-import threading, os
+from flask import Flask
+from threading import Thread
 
-app = Flask(__name__)
+app = Flask('')
 
-@app.route("/")
+@app.route('/')
 def home():
-    return os.environ.get("KEEP_ALIVE_MSG", "✅ Pump.fun watcher running")
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"}), 200
+    return "Bot is alive!"
 
 def run():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
 
 def keep_alive():
-    t = threading.Thread(target=run, daemon=True)
+    t = Thread(target=run)
     t.start()
