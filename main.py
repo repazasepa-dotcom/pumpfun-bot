@@ -1,78 +1,75 @@
 import os
 import asyncio
-import aiohttp
+from solana.rpc.async_api import AsyncClient
+from solana.publickey import PublicKey
 from telethon import TelegramClient
 from keep_alive import keep_alive
 
-# Start keep-alive
+# Start keep-alive web server
 keep_alive()
-print("✅ Bot online + Keep alive started")
+print("✅ Keep-alive server started")
 
-# ----------------------------
-# ENVIRONMENT VARIABLES
-# ----------------------------
+# Telegram Bot Config
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "3"))  # Check every 3 seconds
 
-# Telegram client
-client = TelegramClient('pumpfun', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# Poll interval in seconds
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 
-# ----------------------------
-# Fetch Pump.fun transactions
-# ----------------------------
-async def fetch_transactions():
-    url = "https://frontend-api.pump.fun/transactions?limit=50"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            try:
-                return await resp.json()
-            except:
-                return []
+# Initialize Telegram client
+client = TelegramClient('solana_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# ----------------------------
-# Monitor transactions
-# ----------------------------
+# Solana RPC client
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+sol_client = AsyncClient(SOLANA_RPC)
+
+# Keep track of already seen token mints
+seen_tokens = set()
+
+async def fetch_new_tokens():
+    """
+    Placeholder: Scan Solana blockchain for new SPL tokens.
+    This is simplified for demonstration purposes.
+    """
+    # Example: replace with real RPC calls to get new tokens
+    # For testing, you can just simulate new tokens
+    import random, string
+    mint = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return [{"mint": mint, "symbol": f"TOKEN{mint}"}]
+
 async def monitor():
-    seen_tx = set()  # Keep track of transactions
-
     while True:
         try:
-            data = await fetch_transactions()
-            if not data:
-                print("⚠️ No data returned from Pump.fun API")
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
+            tokens = await fetch_new_tokens()
 
-            for tx in data:
-                tx_id = tx.get("id")
-                symbol = tx.get("coinSymbol")
-                mint = tx.get("coinMint")
-                tx_type = tx.get("type")  # 'buy' or 'sell'
-                amount = tx.get("amount", 0)
+            for token in tokens:
+                mint = token["mint"]
+                symbol = token["symbol"]
 
-                if tx_id in seen_tx:
+                if mint in seen_tokens:
                     continue
-                seen_tx.add(tx_id)
+                seen_tokens.add(mint)
 
+                # Compose Telegram message
                 message = (
-                    f"💥 New Transaction!\n"
-                    f"💠 Coin: `{symbol}`\n"
-                    f"🧬 Mint: `{mint}`\n"
-                    f"📊 Type: {tx_type.upper()}\n"
-                    f"💰 Amount: {amount}\n"
-                    f"🔗 https://pump.fun/{mint}"
+                    f"🔥 New Solana Token Detected\n"
+                    f"💠 Symbol: {symbol}\n"
+                    f"🧬 Mint: {mint}\n"
+                    f"🔗 https://solscan.io/token/{mint}"
                 )
 
-                await client.send_message(TELEGRAM_CHAT, message, parse_mode="md")
-                print(f"✅ Posted {symbol} {tx_type} transaction")
+                await client.send_message(TELEGRAM_CHAT, message)
+                print(f"✅ Posted {symbol}")
 
         except Exception as e:
             print("⚠️ Error:", e)
 
         await asyncio.sleep(POLL_INTERVAL)
 
-# ----------------------------
-# Run bot
+async def main():
+    await monitor()
+
+# Run the monitoring bot
+client.loop.run_until_complete(main())
