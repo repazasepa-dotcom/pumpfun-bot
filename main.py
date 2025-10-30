@@ -1,86 +1,72 @@
 import os
 import time
 import requests
-from datetime import datetime
 from flask import Flask
 import threading
-from telegram import Bot
 
-# ------------------- ENV VARIABLES -------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("TELEGRAM_CHAT")  # @YourChannel
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 20))
-LOWCAP_THRESHOLD = int(os.getenv("LOWCAP_THRESHOLD_MC", 5000))
-KEEP_ALIVE_MSG = os.getenv("KEEP_ALIVE_MSG", "✅ Pump.fun watcher running")
+CHAT = os.getenv("TELEGRAM_CHAT")
+CHECK = int(os.getenv("POLL_INTERVAL", 20))
+LOWCAP = int(os.getenv("LOWCAP_THRESHOLD_MC", 5000))
 
-bot = Bot(token=BOT_TOKEN)
+API_PUMP = "https://api.pump.fun/coins"
+API_TREND = "https://api.dexscreener.com/latest/dex/tokens/solana"
 
-# ------------------- FLASK KEEP ALIVE -------------------
-app = Flask(__name__)
+sent = set()
 
-@app.route('/')
-def home():
-    return KEEP_ALIVE_MSG
-
-def run_web():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_web, daemon=True).start()
-
-# ------------------- TRACKER LOGIC -------------------
-last_seen = set()
-
-def get_new_coins():
+def get_pump_new():
     try:
-        url = "https://pump.fun/api/trending/1?sort=created"
-        data = requests.get(url, timeout=10).json()
-        return data
-    except Exception as e:
-        print("Error fetching pump.fun:", e)
+        data = requests.get(API_PUMP, timeout=10).json()
+        return data.get("coins", [])
+    except:
         return []
 
-def format_alert(coin):
-    name = coin.get("name", "Unknown")
-    mint = coin.get("mint", "")
-    mc = round(coin.get("marketCap", 0))
+def trending_score(mint):
+    try:
+        r = requests.get(f"{API_TREND}/{mint}", timeout=10).json()
+        d = r.get("pairs", [{}])[0]
+        return d.get("socials", {}).get("twitterScore", 0)
+    except:
+        return 0
 
-    link = f"https://pump.fun/coin/{mint}"
+def notify(text):
+    requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                 params={"chat_id": CHAT, "text": text, "parse_mode": "HTML"})
+
+def run():
+    notify("⚡ Pump.fun + X-trend tracker started")
     
-    message = (
-        f"🚨 **New Meme Coin Launched!**\n\n"
-        f"🪙 **{name}**\n"
-        f"💰 Marketcap: **${mc}**\n"
-        f"🔗 Pump.fun: {link}\n\n"
-        f"⚠️ DYOR — new coin detected!"
-    )
-    return message
-
-def post_alert(coin):
-    msg = format_alert(coin)
-    bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode="Markdown")
-
-def run_tracker():
-    print("✅ Pump.fun tracker started")
-
     while True:
-        coins = get_new_coins()
-
-        for coin in coins:
-            mint = coin.get("mint")
-            mc = coin.get("marketCap", 0)
-
-            if mint in last_seen:
+        coins = get_pump_new()
+        for c in coins:
+            mint = c.get("mint")
+            if not mint or mint in sent: 
                 continue
 
-            # Only alert low market cap coins
-            if mc <= LOWCAP_THRESHOLD:
-                post_alert(coin)
+            mc = c.get("market_cap", 0)
+            score = trending_score(mint)
 
-            last_seen.add(mint)
+            if mc < LOWCAP and score > 2:  # boosts detection
+                text = f"""
+🔥 <b>Potential Viral Meme</b>
 
-        time.sleep(POLL_INTERVAL)
+🌱 <b>Token:</b> {c.get('name')}  
+💰 <b>Market Cap:</b> {mc}
+🐦 <b>Twitter Hype Score:</b> {score}
+🔗 Mint: <code>{mint}</code>
+🚀 pump.fun: https://pump.fun/{mint}
+                """
+                notify(text)
+                sent.add(mint)
 
-# ------------------- START -------------------
+        time.sleep(CHECK)
+
+# ✅ Flask keep-alive
+app = Flask(__name__)
+@app.route("/") 
+def home(): return "Pump fun watcher alive ✅"
+def keep_alive(): threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000), daemon=True).start()
+
 if __name__ == "__main__":
-    run_tracker()
+    keep_alive()
+    run()
