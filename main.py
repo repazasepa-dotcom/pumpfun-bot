@@ -161,16 +161,18 @@ async def main():
     app.add_handler(CommandHandler("newcoins", newcoins))
     app.add_handler(CommandHandler("info", token_info))
 
-    # Start bot (job_queue is created here)
+    # --- NEW: Proper initialize BEFORE start ---
+    await app.initialize()  # job_queue & internals created
+
+    # Start bot
     await app.start()
     await app.updater.start_polling()
 
-    # Now job_queue exists — schedule tasks
+    # Schedule repeating tasks
     app.job_queue.run_repeating(lambda ctx: create_task(send_presale_alerts(app.bot)), interval=CHECK_INTERVAL, first=10)
     app.job_queue.run_repeating(lambda ctx: create_task(price_alert_task(app.bot)), interval=PRICE_CHECK_INTERVAL, first=15)
 
     print("🤖 Bot running, alerts scheduled.")
-
     await app.idle()
 
 if __name__ == "__main__":
