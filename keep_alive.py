@@ -1,7 +1,6 @@
-# keep_alive.py
 from flask import Flask
 
-PORT = int(__import__('os').environ.get("PORT", 10000))
+PORT = 10000
 app = Flask("KeepAlive")
 
 @app.route("/")
