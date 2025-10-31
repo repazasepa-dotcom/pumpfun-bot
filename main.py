@@ -3,7 +3,6 @@ import os
 import asyncio
 import requests
 import math
-import imghdr  # Backport for Python 3.13
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telethon.sync import TelegramClient
@@ -185,7 +184,7 @@ async def main():
     from asyncio import create_task
     app.job_queue.run_repeating(lambda ctx:create_task(send_presale_alerts(app.bot, TelegramClient("anon", API_ID, API_HASH))), interval=CHECK_INTERVAL, first=10)
     app.job_queue.run_repeating(lambda ctx:create_task(price_alert_task(app.bot)), interval=PRICE_CHECK_INTERVAL, first=15)
-    print("🤖 Bot running with Etherscan V2, presale & price alerts, Python 3.13-ready.")
+    print("🤖 Bot running with Etherscan V2, presale & price alerts, Python 3.12-ready.")
     app.run_polling()
 
 if __name__=="__main__":
