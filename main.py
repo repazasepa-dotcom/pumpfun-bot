@@ -1,22 +1,24 @@
+# main.py
 import os
 import asyncio
 import requests
-import threading
+from flask import Flask
+from telegram import constants
 from telegram.ext import ApplicationBuilder, CommandHandler
 from keep_alive import run_flask
 from liquidity import check_liquidity
 from community import get_community_score
 
-# ENV VARIABLES
+# ---------------- ENV VARIABLES ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@PumpFunMemeCoinAlert")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
 PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", "300"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@PumpFunMemeCoinAlert")
 
 last_presales = []
 previous_prices = {}
 
-# PRESALES
+# ---------------- PRESALES ----------------
 def get_presales():
     presales = []
     try:
@@ -41,8 +43,8 @@ def get_presales():
         print("Presale fetch error:", e)
     return presales
 
-# ALERTS
-async def send_presale_alerts(bot):
+# ---------------- ALERTS ----------------
+async def send_presale_alerts(app):
     presales = get_presales()
     for p in presales:
         liquidity = check_liquidity(p['lp_contract'], p['lock_address'])
@@ -57,11 +59,11 @@ async def send_presale_alerts(bot):
             f"*Website:* [Link]({p['url']})"
         )
         try:
-            await bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
+            await app.bot.send_message(CHANNEL_ID, msg, parse_mode=constants.ParseMode.MARKDOWN)
         except Exception as e:
             print("Alert send error:", e)
 
-async def price_alert_task(bot):
+async def price_alert_task(app):
     COINGECKO_API = "https://api.coingecko.com/api/v3/simple/token_price/binance-smart-chain"
     while True:
         for p in last_presales:
@@ -69,9 +71,10 @@ async def price_alert_task(bot):
                 token = p['token_contract']
                 params = {"contract_addresses": token, "vs_currencies": "usd"}
                 price = requests.get(COINGECKO_API, params=params, timeout=10).json().get(token.lower(), {}).get("usd")
-                if price is None: continue
+                if price is None: 
+                    continue
                 old = previous_prices.get(token)
-                if old is None:
+                if old is None: 
                     previous_prices[token] = price
                     continue
                 change = ((price - old) / old) * 100
@@ -81,42 +84,56 @@ async def price_alert_task(bot):
                         f"Price: ${price:.6f} ({change:+.2f}%)\n"
                         f"[Contract](https://bscscan.com/token/{token})"
                     )
-                    await bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
+                    await app.bot.send_message(CHANNEL_ID, msg, parse_mode=constants.ParseMode.MARKDOWN)
                     previous_prices[token] = price
             except Exception as e:
                 print("Price alert error:", e)
         await asyncio.sleep(PRICE_CHECK_INTERVAL)
 
-# COMMANDS
+# ---------------- COMMANDS ----------------
 async def start(update, context):
     await update.message.reply_text(
         "🚀 MemeCoin Scout Bot\n"
-        "/newcoins"
+        "/newcoins\n/watchlist_add <coin_id>\n/watchlist_remove <coin_id>\n/watchlist_show\n/info <coin_id>"
     )
 
 async def newcoins(update, context):
     presales = get_presales()
-    if not presales:
+    if not presales: 
         await update.message.reply_text("No new presales.")
         return
     msg = "🆕 Latest Presales:\n" + "\n".join([f"{p['name']} ({p['coin_id']}) - {p['url']}" for p in presales[:5]])
     await update.message.reply_text(msg)
 
-# MAIN
+# ---------------- MAIN ----------------
 async def main():
-    threading.Thread(target=run_flask).start()
+    # Start Flask keep-alive
+    import threading
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
 
+    # Build Telegram bot app
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("newcoins", newcoins))
 
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(send_presale_alerts(app.bot)),
-                                interval=CHECK_INTERVAL, first=10)
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(price_alert_task(app.bot)),
-                                interval=PRICE_CHECK_INTERVAL, first=15)
+    # Start background tasks
+    asyncio.create_task(periodic_task(app, send_presale_alerts, CHECK_INTERVAL))
+    asyncio.create_task(periodic_task(app, price_alert_task, PRICE_CHECK_INTERVAL))
 
-    print("🤖 Bot running with presale & price alerts, Python-telegram-bot v20-ready.")
+    print("🤖 Bot running with presale & price alerts, PTB v20-ready.")
     await app.run_polling()
+
+# ---------------- UTILITY ----------------
+async def periodic_task(app, func, interval):
+    while True:
+        try:
+            await func(app)
+        except Exception as e:
+            print(f"Background task error: {e}")
+        await asyncio.sleep(interval)
 
 if __name__ == "__main__":
     asyncio.run(main())
