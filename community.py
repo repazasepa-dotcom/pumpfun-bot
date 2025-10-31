@@ -1,14 +1,8 @@
-import math
-
-# Option B: no Telethon, just a static lookup
-community_channels = {
-    "pepedoge": "https://t.me/pepedoge",
-}
-
+# Mock community scoring without Telethon
 def get_community_score(coin_id):
-    try:
-        # For now, static dummy score
-        return 50  # adjust logic if you have other APIs
-    except Exception as e:
-        print(f"Community score error for {coin_id}: {e}")
-        return 0
+    # You can replace this with real API-based scoring if available
+    community_data = {
+        "pepedoge": 70,
+        "sachicoin": 45,
+    }
+    return community_data.get(coin_id, 0)
