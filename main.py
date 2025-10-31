@@ -8,7 +8,6 @@ from keep_alive import run_flask
 from liquidity import check_liquidity
 from community import get_community_score
 import requests
-import math
 
 # ---------------- ENV VARIABLES ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -16,7 +15,6 @@ ETHERSCAN_V2_KEY = os.getenv("ETHERSCAN_V2_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@PumpFunMemeCoinAlert")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
 PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", "300"))
-CHAIN_ID_BSC = 56  # Binance Smart Chain
 
 # ---------------- DATA ----------------
 watchlist = {}
@@ -146,6 +144,9 @@ async def token_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- MAIN ----------------
 async def main():
+    import threading
+    from asyncio import create_task
+
     # Start Flask keep-alive
     t = threading.Thread(target=run_flask)
     t.start()
@@ -165,14 +166,14 @@ async def main():
     await app.initialize()
 
     # Schedule repeating tasks
-    from asyncio import create_task
     app.job_queue.run_repeating(lambda ctx: create_task(send_presale_alerts(app.bot)), interval=CHECK_INTERVAL, first=10)
     app.job_queue.run_repeating(lambda ctx: create_task(price_alert_task(app.bot)), interval=PRICE_CHECK_INTERVAL, first=15)
 
     # Start polling
+    print("🤖 Bot starting...")
     await app.start()
     await app.updater.start_polling()
-    print("🤖 Bot running with Python 3.13, Telethon-free.")
+    print("✅ Bot started polling")
     await app.idle()
 
 if __name__ == "__main__":
