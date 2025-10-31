@@ -1,20 +1,14 @@
 import math
-from telethon import TelegramClient
-from telethon.tl.functions.channels import GetFullChannel
+import requests
 
-community_channels = {
-    "pepedoge": "https://t.me/pepedoge",
-}
-
-async def get_community_score(client: TelegramClient, coin_id: str):
+async def get_community_score(coin_id: str):
     try:
-        channel_link = community_channels.get(coin_id)
-        if not channel_link:
-            return 0
-        channel_entity = await client.get_entity(channel_link)
-        full = await client(GetFullChannel(channel=channel_entity))
-        member_count = full.full_chat.participants_count
-        score = min(100, int(math.log(member_count + 1) * 10))
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id.lower()}"
+        resp = requests.get(url, timeout=10).json()
+        data = resp.get("community_data", {})
+        twitter = data.get("twitter_followers", 0) or 0
+        reddit = data.get("reddit_subscribers", 0) or 0
+        score = min(100, int((twitter + reddit + 1)**0.1 * 10))  # logarithmic-like scaling
         return score
     except Exception as e:
         print(f"Community score error for {coin_id}: {e}")
