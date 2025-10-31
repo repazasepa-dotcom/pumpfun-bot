@@ -1,5 +1,4 @@
-telethon==1.41.2
-aiohttp==3.8.5
-Flask==3.1.2
-requests==2.32.5
-python-3.12.13
+python-telegram-bot==20.4
+telethon==1.28.0
+Flask==2.3.2
+requests==2.31.0
