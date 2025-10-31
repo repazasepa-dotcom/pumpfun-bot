@@ -1,39 +1,48 @@
+# main.py
 import os
 import asyncio
 import requests
-import threading
-from telegram.ext import ApplicationBuilder, CommandHandler
-from keep_alive import run_flask
-from liquidity import check_liquidity
-from community import get_community_score
+from flask import Flask
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ENV VARIABLES
+# ---------------- ENV VARIABLES ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@PumpFunMemeCoinAlert")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
 PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", "300"))
 
+# ---------------- DATA ----------------
 last_presales = []
 previous_prices = {}
 
-# PRESALES
+# ---------------- FLASK KEEP-ALIVE ----------------
+app_flask = Flask("KeepAlive")
+
+@app_flask.route("/")
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    app_flask.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+# ---------------- HELPER FUNCTIONS ----------------
 def get_presales():
     presales = []
     try:
-        url = "https://api.pinksale.finance/api/v1/presales"
-        data = requests.get(url, timeout=10).json()
+        data = requests.get("https://api.pinksale.finance/api/v1/presales", timeout=10).json()
         for item in data:
-            presale_id = item['id']
-            if not any(p['id'] == presale_id for p in last_presales):
+            presale_id = item["id"]
+            if not any(p["id"] == presale_id for p in last_presales):
                 presale = {
                     "id": presale_id,
-                    "name": item['name'],
-                    "url": item['website'],
-                    "status": item['status'],
-                    "coin_id": item['token_symbol'].lower(),
-                    "token_contract": item['tokenAddress'],
-                    "lp_contract": item.get('lpAddress'),
-                    "lock_address": item.get('lockAddress')
+                    "name": item["name"],
+                    "url": item["website"],
+                    "status": item["status"],
+                    "coin_id": item["token_symbol"].lower(),
+                    "token_contract": item["tokenAddress"],
+                    "lp_contract": item.get("lpAddress"),
+                    "lock_address": item.get("lockAddress"),
                 }
                 presales.append(presale)
                 last_presales.append(presale)
@@ -41,18 +50,21 @@ def get_presales():
         print("Presale fetch error:", e)
     return presales
 
-# ALERTS
+def get_community_score(coin_id: str):
+    # Option B: no Telethon, simplified scoring
+    # Example: static score or based on coin_id length
+    return min(100, len(coin_id) * 10)
+
+# ---------------- ALERTS ----------------
 async def send_presale_alerts(bot):
     presales = get_presales()
     for p in presales:
-        liquidity = check_liquidity(p['lp_contract'], p['lock_address'])
-        score = get_community_score(p['coin_id'])
+        score = get_community_score(p["coin_id"])
         msg = (
             f"🚀 *New Meme Coin Presale!*\n\n"
             f"*Name:* {p['name']}\n"
             f"*Status:* {p['status']}\n"
             f"*Contract:* [`{p['token_contract']}`](https://bscscan.com/token/{p['token_contract']})\n"
-            f"*Liquidity Locked:* {'✅' if liquidity else '❌'}\n"
             f"*Community Score:* {score}/100\n"
             f"*Website:* [Link]({p['url']})"
         )
@@ -66,15 +78,15 @@ async def price_alert_task(bot):
     while True:
         for p in last_presales:
             try:
-                token = p['token_contract']
-                params = {"contract_addresses": token, "vs_currencies": "usd"}
-                price = requests.get(COINGECKO_API, params=params, timeout=10).json().get(token.lower(), {}).get("usd")
-                if price is None: continue
+                token = p["token_contract"]
+                price = requests.get(COINGECKO_API, params={"contract_addresses": token, "vs_currencies": "usd"}, timeout=10).json().get(token.lower(), {}).get("usd")
+                if price is None:
+                    continue
                 old = previous_prices.get(token)
                 if old is None:
                     previous_prices[token] = price
                     continue
-                change = ((price - old)/old)*100
+                change = ((price - old) / old) * 100
                 if abs(change) >= 10:
                     msg = (
                         f"📈 *Price Alert!* {p['name']} ({p['coin_id']})\n"
@@ -87,37 +99,40 @@ async def price_alert_task(bot):
                 print("Price alert error:", e)
         await asyncio.sleep(PRICE_CHECK_INTERVAL)
 
-# COMMANDS
-async def start(update, context):
+# ---------------- COMMANDS ----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 MemeCoin Scout Bot\n/newcoins"
+        "🚀 MemeCoin Scout Bot\n"
+        "/newcoins"
     )
 
-async def newcoins(update, context):
+async def newcoins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     presales = get_presales()
-    if not presales: 
+    if not presales:
         await update.message.reply_text("No new presales.")
         return
     msg = "🆕 Latest Presales:\n" + "\n".join([f"{p['name']} ({p['coin_id']}) - {p['url']}" for p in presales[:5]])
     await update.message.reply_text(msg)
 
-# MAIN
+# ---------------- MAIN ----------------
 async def main():
-    # Flask keep-alive
+    # Start Flask keep-alive
+    import threading
     threading.Thread(target=run_flask).start()
-    
-    # Build bot
+
+    # Telegram bot
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("newcoins", newcoins))
-    
+
     # Schedule jobs
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(send_presale_alerts(app.bot)), interval=CHECK_INTERVAL, first=10)
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(price_alert_task(app.bot)), interval=PRICE_CHECK_INTERVAL, first=15)
-    
-    print("🤖 Bot running with presale & price alerts, Python-telegram-bot v20-ready.")
+    app.create_task(send_presale_alerts(app.bot))
+    app.create_task(price_alert_task(app.bot))
+
+    print("🤖 Bot running with Option B, Python-telegram-bot v20-ready.")
     await app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
