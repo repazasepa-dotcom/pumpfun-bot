@@ -1,6 +1,6 @@
 import os
 import asyncio
-import requests
+import aiohttp
 from telethon import TelegramClient
 from keep_alive import keep_alive
 
@@ -11,8 +11,8 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-MAX_MARKETCAP = int(os.getenv("MAX_MARKETCAP", "10000000"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds
+MAX_MARKETCAP = int(os.getenv("MAX_MARKETCAP", "10000000"))  # USD
 
 # -----------------------------
 # Telegram client
@@ -29,72 +29,66 @@ print("✅ Bot online + keep-alive started")
 # Meme coin detection
 # -----------------------------
 MEME_KEYWORDS = ["doge", "shiba", "pepe", "moon", "lil", "baby"]
-HONEYPOT_KEYWORDS = ["max sell", "cannot sell", "trapped", "no sell", "dev control", "rug"]
 SEEN_COINS = set()
+HONEYPOT_KEYWORDS = ["max sell", "cannot sell", "trapped", "no sell", "dev control", "rug"]
 
 # -----------------------------
-# CoinGecko API
+# Async CoinGecko fetch
 # -----------------------------
-def get_new_meme_coins(vs_currency="usd", per_page=50, page=1):
+async def fetch_new_coins(session):
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
-        "vs_currency": vs_currency,
+        "vs_currency": "usd",
         "order": "market_cap_asc",
-        "per_page": per_page,
-        "page": page,
+        "per_page": 50,
+        "page": 1,
         "sparkline": False,
         "price_change_percentage": "1h,24h"
     }
     try:
-        response = requests.get(url, params=params, timeout=15)
-        coins = response.json()
+        async with session.get(url, params=params, timeout=15) as r:
+            data = await r.json()
     except Exception as e:
         print("⚠️ CoinGecko API error:", e)
         return []
 
     meme_candidates = []
-    for coin in coins:
+    for coin in data:
         name_symbol = f"{coin['name'].lower()} {coin['symbol'].lower()}"
-        desc = coin.get("description", {}).get("en", "").lower() if "description" in coin else ""
-        
-        if any(k in desc for k in HONEYPOT_KEYWORDS):
-            continue  # skip honeypot-like coins
-
         if any(k in name_symbol for k in MEME_KEYWORDS):
             if coin.get('market_cap') and coin['market_cap'] <= MAX_MARKETCAP:
                 meme_candidates.append(coin)
     return meme_candidates
 
 # -----------------------------
-# Social hype check (simple)
+# Async social hype check
 # -----------------------------
-def check_social_hype(name, symbol):
-    # Simple heuristic: check Twitter search page HTML
+async def check_social_hype(session, name, symbol):
     try:
         url = f"https://nitter.net/search?f=tweets&q={name}+{symbol}"
-        r = requests.get(url, timeout=10)
-        text = r.text.lower()
-        hype_keywords = ["🚀", "moon", "to the moon", "shill", "bullish"]
-        return any(k in text for k in hype_keywords)
+        async with session.get(url, timeout=10) as r:
+            text = await r.text()
+            hype_keywords = ["🚀", "moon", "to the moon", "shill", "bullish"]
+            return any(k in text.lower() for k in hype_keywords)
     except:
         return False
 
 # -----------------------------
 # Send Telegram alert
 # -----------------------------
-async def send_alert(coin):
+async def send_alert(session, coin):
     if coin['id'] in SEEN_COINS:
         return
     SEEN_COINS.add(coin['id'])
 
-    hype = check_social_hype(coin['name'], coin['symbol'])
+    hype = await check_social_hype(session, coin['name'], coin['symbol'])
 
     msg = (
         f"🚀 *Meme Coin Alert!*\n"
         f"💠 Name: {coin['name']} ({coin['symbol'].upper()})\n"
         f"💰 Price: ${coin['current_price']:,}\n"
         f"📊 Market Cap: ${coin['market_cap']:,}\n"
-        f"📈 24h Change: {coin['price_change_percentage_24h']:.2f}%\n"
+        f"📈 24h Change: {coin.get('price_change_percentage_24h', 0):.2f}%\n"
         f"📢 Social Hype: {'✅ Active buzz' if hype else '❌ None'}\n"
         f"🔗 CoinGecko: https://www.coingecko.com/en/coins/{coin['id']}"
     )
@@ -105,20 +99,20 @@ async def send_alert(coin):
 # Monitor loop
 # -----------------------------
 async def monitor():
-    while True:
-        try:
-            coins = get_new_meme_coins()
-            if coins:
-                print(f"⏳ Found {len(coins)} meme coin candidates")
-            for coin in coins:
-                await send_alert(coin)
-        except Exception as e:
-            print("⚠️ Monitor error:", e)
-
-        await asyncio.sleep(POLL_INTERVAL)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                coins = await fetch_new_coins(session)
+                if coins:
+                    print(f"⏳ Found {len(coins)} meme coin candidates")
+                for coin in coins:
+                    await send_alert(session, coin)
+            except Exception as e:
+                print("⚠️ Monitor error:", e)
+            await asyncio.sleep(POLL_INTERVAL)
 
 # -----------------------------
-# Run
+# Run bot
 # -----------------------------
 async def main():
     await monitor()
