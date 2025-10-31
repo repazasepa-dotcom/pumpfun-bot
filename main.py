@@ -1,11 +1,14 @@
+# main.py
 import os
 import asyncio
-import requests
 import threading
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from keep_alive import run_flask
 from liquidity import check_liquidity
+from community import get_community_score
+import requests
+import math
 
 # ---------------- ENV VARIABLES ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -13,27 +16,14 @@ ETHERSCAN_V2_KEY = os.getenv("ETHERSCAN_V2_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@PumpFunMemeCoinAlert")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
 PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", "300"))
+CHAIN_ID_BSC = 56  # Binance Smart Chain
 
 # ---------------- DATA ----------------
 watchlist = {}
 last_presales = []
 previous_prices = {}
 
-# ---------------- COMMUNITY SCORE (CoinGecko) ----------------
-async def get_community_score(coin_id: str):
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id.lower()}"
-        resp = requests.get(url, timeout=10).json()
-        data = resp.get("community_data", {})
-        twitter = data.get("twitter_followers", 0) or 0
-        reddit = data.get("reddit_subscribers", 0) or 0
-        score = min(100, int((twitter + reddit + 1)**0.1 * 10))  # logarithmic-like scaling
-        return score
-    except Exception as e:
-        print(f"Community score error for {coin_id}: {e}")
-        return 0
-
-# ---------------- PRESALES ----------------
+# ---------------- HELPER FUNCTIONS ----------------
 def get_presales():
     presales = []
     try:
@@ -41,7 +31,7 @@ def get_presales():
         data = requests.get(url, timeout=10).json()
         for item in data:
             presale_id = item['id']
-            if not any(p['id']==presale_id for p in last_presales):
+            if not any(p['id'] == presale_id for p in last_presales):
                 presale = {
                     "id": presale_id,
                     "name": item['name'],
@@ -86,12 +76,13 @@ async def price_alert_task(bot):
                 token = p['token_contract']
                 params = {"contract_addresses": token, "vs_currencies": "usd"}
                 price = requests.get(COINGECKO_API, params=params, timeout=10).json().get(token.lower(), {}).get("usd")
-                if price is None: continue
+                if price is None: 
+                    continue
                 old = previous_prices.get(token)
-                if old is None:
+                if old is None: 
                     previous_prices[token] = price
                     continue
-                change = ((price-old)/old)*100
+                change = ((price - old) / old) * 100
                 if abs(change) >= 10:
                     msg = (
                         f"📈 *Price Alert!* {p['name']} ({p['coin_id']})\n"
@@ -113,7 +104,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def watchlist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user.id
-    if len(context.args) == 0:
+    if len(context.args) == 0: 
         await update.message.reply_text("Usage: /watchlist_add <coin_id>")
         return
     coin = context.args[0].lower()
@@ -122,14 +113,14 @@ async def watchlist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def watchlist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user.id
-    if len(context.args) == 0:
+    if len(context.args) == 0: 
         await update.message.reply_text("Usage: /watchlist_remove <coin_id>")
         return
     coin = context.args[0].lower()
     if user in watchlist and coin in watchlist[user]:
         watchlist[user].remove(coin)
         await update.message.reply_text(f"❌ {coin} removed.")
-    else:
+    else: 
         await update.message.reply_text(f"{coin} not in watchlist.")
 
 async def watchlist_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -139,14 +130,14 @@ async def watchlist_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def newcoins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     presales = get_presales()
-    if not presales:
+    if not presales: 
         await update.message.reply_text("No new presales.")
         return
     msg = "🆕 Latest Presales:\n" + "\n".join([f"{p['name']} ({p['coin_id']}) - {p['url']}" for p in presales[:5]])
     await update.message.reply_text(msg)
 
 async def token_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) == 0:
+    if len(context.args) == 0: 
         await update.message.reply_text("Usage: /info <coin_id>")
         return
     coin = context.args[0].lower()
@@ -159,8 +150,10 @@ async def main():
     t = threading.Thread(target=run_flask)
     t.start()
 
-    # Start Telegram Bot
+    # Build Telegram Bot
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("watchlist_add", watchlist_add))
     app.add_handler(CommandHandler("watchlist_remove", watchlist_remove))
@@ -168,13 +161,19 @@ async def main():
     app.add_handler(CommandHandler("newcoins", newcoins))
     app.add_handler(CommandHandler("info", token_info))
 
-    # Schedule tasks
+    # Initialize app to create job_queue
+    await app.initialize()
+
+    # Schedule repeating tasks
     from asyncio import create_task
     app.job_queue.run_repeating(lambda ctx: create_task(send_presale_alerts(app.bot)), interval=CHECK_INTERVAL, first=10)
     app.job_queue.run_repeating(lambda ctx: create_task(price_alert_task(app.bot)), interval=PRICE_CHECK_INTERVAL, first=15)
 
-    print("🤖 Bot running without Telethon, using CoinGecko social scores.")
-    app.run_polling()
+    # Start polling
+    await app.start()
+    await app.updater.start_polling()
+    print("🤖 Bot running with Python 3.13, Telethon-free.")
+    await app.idle()
 
 if __name__ == "__main__":
     asyncio.run(main())
