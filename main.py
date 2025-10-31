@@ -1,120 +1,223 @@
+# meme_coin_scout_bot_full.py
 import os
 import asyncio
-import aiohttp
-from telethon import TelegramClient
-from keep_alive import keep_alive
+import requests
+import math
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telethon.sync import TelegramClient
+from telethon.tl.functions.channels import GetFullChannel
+from flask import Flask
+import threading
 
-# -----------------------------
-# ENVIRONMENT VARIABLES
-# -----------------------------
-API_ID = int(os.getenv("API_ID"))
+# ---------------- ENVIRONMENT VARIABLES ----------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds
-MAX_MARKETCAP = int(os.getenv("MAX_MARKETCAP", "10000000"))  # USD
+BSC_API_KEY = os.getenv("BSC_API_KEY")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@PumpFunMemeCoinAlert")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))  # presale alert interval in sec
+PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", "300"))  # price check interval in sec
 
-# -----------------------------
-# Telegram client
-# -----------------------------
-client = TelegramClient('meme_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# ---------------- DATA STORAGE ----------------
+watchlist = {}
+last_presales = []  # list of dicts with coin info
+previous_prices = {}  # token_address: last_price
 
-# -----------------------------
-# Keep-alive
-# -----------------------------
-keep_alive()
-print("✅ Bot online + keep-alive started")
+community_channels = {
+    "pepedoge": "https://t.me/pepedoge",
+}
 
-# -----------------------------
-# Meme coin detection
-# -----------------------------
-MEME_KEYWORDS = ["doge", "shiba", "pepe", "moon", "lil", "baby"]
-SEEN_COINS = set()
-HONEYPOT_KEYWORDS = ["max sell", "cannot sell", "trapped", "no sell", "dev control", "rug"]
+# ---------------- FLASK KEEP ALIVE ----------------
+app_flask = Flask("KeepAlive")
 
-# -----------------------------
-# Async CoinGecko fetch
-# -----------------------------
-async def fetch_new_coins(session):
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_asc",
-        "per_page": 50,
-        "page": 1,
-        "sparkline": False,
-        "price_change_percentage": "1h,24h"
-    }
+@app_flask.route("/")
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+# ---------------- HELPER FUNCTIONS ----------------
+def get_presales():
+    presales = []
     try:
-        async with session.get(url, params=params, timeout=15) as r:
-            data = await r.json()
+        url = "https://api.pinksale.finance/api/v1/presales"
+        data = requests.get(url, timeout=10).json()
+        for item in data:
+            presale_id = item['id']
+            if not any(p['id'] == presale_id for p in last_presales):
+                presale = {
+                    "id": presale_id,
+                    "name": item['name'],
+                    "url": item['website'],
+                    "status": item['status'],
+                    "coin_id": item['token_symbol'].lower(),
+                    "token_contract": item['tokenAddress'],
+                    "lp_contract": item.get('lpAddress'),
+                    "lock_address": item.get('lockAddress')
+                }
+                presales.append(presale)
+                last_presales.append(presale)
     except Exception as e:
-        print("⚠️ CoinGecko API error:", e)
-        return []
+        print("Error fetching presales:", e)
+    return presales
 
-    meme_candidates = []
-    for coin in data:
-        name_symbol = f"{coin['name'].lower()} {coin['symbol'].lower()}"
-        if any(k in name_symbol for k in MEME_KEYWORDS):
-            if coin.get('market_cap') and coin['market_cap'] <= MAX_MARKETCAP:
-                meme_candidates.append(coin)
-    return meme_candidates
-
-# -----------------------------
-# Async social hype check
-# -----------------------------
-async def check_social_hype(session, name, symbol):
+def check_liquidity(lp_contract, lock_address):
     try:
-        url = f"https://nitter.net/search?f=tweets&q={name}+{symbol}"
-        async with session.get(url, timeout=10) as r:
-            text = await r.text()
-            hype_keywords = ["🚀", "moon", "to the moon", "shill", "bullish"]
-            return any(k in text.lower() for k in hype_keywords)
-    except:
+        url = f"https://api.bscscan.com/api?module=account&action=tokenbalance&contractaddress={lp_contract}&address={lock_address}&apikey={BSC_API_KEY}"
+        data = requests.get(url, timeout=10).json()
+        balance = int(data['result'])
+        return balance > 0
+    except Exception as e:
+        print("Liquidity check error:", e)
         return False
 
-# -----------------------------
-# Send Telegram alert
-# -----------------------------
-async def send_alert(session, coin):
-    if coin['id'] in SEEN_COINS:
+def get_community_score(client, coin_id):
+    try:
+        channel_link = community_channels.get(coin_id)
+        if not channel_link:
+            return 0
+        channel_entity = client.get_entity(channel_link)
+        full = client(GetFullChannel(channel=channel_entity))
+        member_count = full.full_chat.participants_count
+        score = min(100, int(math.log(member_count + 1) * 10))
+        return score
+    except Exception as e:
+        print(f"Community score error for {coin_id}: {e}")
+        return 0
+
+# ---------------- ALERT FUNCTIONS ----------------
+async def send_presale_alerts(bot, client):
+    presales = get_presales()
+    if not presales:
         return
-    SEEN_COINS.add(coin['id'])
+    for presale in presales:
+        liquidity_locked = check_liquidity(presale['lp_contract'], presale['lock_address'])
+        community_score = get_community_score(client, presale['coin_id'])
+        msg = (
+            f"🚀 *New Meme Coin Presale!*\n\n"
+            f"*Name:* {presale['name']}\n"
+            f"*Status:* {presale['status']}\n"
+            f"*Contract:* [`{presale['token_contract']}`](https://bscscan.com/token/{presale['token_contract']})\n"
+            f"*Liquidity Locked:* {'✅' if liquidity_locked else '❌'}\n"
+            f"*Community Score:* {community_score}/100\n"
+            f"*Website:* [Link]({presale['url']})\n"
+        )
+        try:
+            await bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            print(f"Error sending presale alert: {e}")
 
-    hype = await check_social_hype(session, coin['name'], coin['symbol'])
-
-    msg = (
-        f"🚀 *Meme Coin Alert!*\n"
-        f"💠 Name: {coin['name']} ({coin['symbol'].upper()})\n"
-        f"💰 Price: ${coin['current_price']:,}\n"
-        f"📊 Market Cap: ${coin['market_cap']:,}\n"
-        f"📈 24h Change: {coin.get('price_change_percentage_24h', 0):.2f}%\n"
-        f"📢 Social Hype: {'✅ Active buzz' if hype else '❌ None'}\n"
-        f"🔗 CoinGecko: https://www.coingecko.com/en/coins/{coin['id']}"
-    )
-    await client.send_message(CHAT_ID, msg, parse_mode='md')
-    print(f"✅ Alert sent for {coin['name']}")
-
-# -----------------------------
-# Monitor loop
-# -----------------------------
-async def monitor():
-    async with aiohttp.ClientSession() as session:
-        while True:
+async def price_alert_task(bot):
+    COINGECKO_API = "https://api.coingecko.com/api/v3/simple/token_price/binance-smart-chain"
+    while True:
+        for presale in last_presales:
             try:
-                coins = await fetch_new_coins(session)
-                if coins:
-                    print(f"⏳ Found {len(coins)} meme coin candidates")
-                for coin in coins:
-                    await send_alert(session, coin)
+                token_address = presale['token_contract']
+                params = {"contract_addresses": token_address, "vs_currencies": "usd"}
+                response = requests.get(COINGECKO_API, params=params, timeout=10).json()
+                price = response.get(token_address.lower(), {}).get("usd")
+                if price is None:
+                    continue
+                old_price = previous_prices.get(token_address)
+                if old_price is None:
+                    previous_prices[token_address] = price
+                    continue
+                change = ((price - old_price) / old_price) * 100
+                if abs(change) >= 10:  # 10% threshold
+                    msg = (
+                        f"📈 *Price Alert!* {presale['name']} ({presale['coin_id']})\n"
+                        f"Price: ${price:.6f} ({change:+.2f}%)\n"
+                        f"[Contract](https://bscscan.com/token/{token_address})"
+                    )
+                    await bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode="Markdown")
+                    previous_prices[token_address] = price
             except Exception as e:
-                print("⚠️ Monitor error:", e)
-            await asyncio.sleep(POLL_INTERVAL)
+                print(f"Price alert error: {e}")
+        await asyncio.sleep(PRICE_CHECK_INTERVAL)
 
-# -----------------------------
-# Run bot
-# -----------------------------
+# ---------------- COMMAND HANDLERS ----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 MemeCoin Scout Bot\n"
+        "Commands:\n"
+        "/newcoins - Show latest presales\n"
+        "/watchlist_add <coin_id>\n"
+        "/watchlist_remove <coin_id>\n"
+        "/watchlist_show\n"
+        "/info <coin_id>"
+    )
+
+async def watchlist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if len(context.args) == 0:
+        await update.message.reply_text("Usage: /watchlist_add <coin_id>")
+        return
+    coin = context.args[0].lower()
+    watchlist.setdefault(user_id, set()).add(coin)
+    await update.message.reply_text(f"✅ {coin} added to your watchlist.")
+
+async def watchlist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if len(context.args) == 0:
+        await update.message.reply_text("Usage: /watchlist_remove <coin_id>")
+        return
+    coin = context.args[0].lower()
+    if user_id in watchlist and coin in watchlist[user_id]:
+        watchlist[user_id].remove(coin)
+        await update.message.reply_text(f"❌ {coin} removed from watchlist.")
+    else:
+        await update.message.reply_text(f"{coin} not in your watchlist.")
+
+async def watchlist_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    coins = watchlist.get(user_id, set())
+    msg = "\n".join(coins) if coins else "Your watchlist is empty."
+    await update.message.reply_text(msg)
+
+async def newcoins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    presales = get_presales()
+    if not presales:
+        await update.message.reply_text("No new presales found.")
+        return
+    msg = "🆕 Latest Presales:\n"
+    for p in presales[:5]:
+        msg += f"{p['name']} ({p['coin_id']}) - {p['url']}\n"
+    await update.message.reply_text(msg)
+
+async def token_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) == 0:
+        await update.message.reply_text("Usage: /info <coin_id>")
+        return
+    coin_id = context.args[0].lower()
+    client = TelegramClient("anon_session", API_ID, API_HASH)
+    await client.start()
+    community_score = get_community_score(client, coin_id)
+    await update.message.reply_text(f"ℹ️ Info for {coin_id}:\nCommunity Score: {community_score}/100")
+
+# ---------------- MAIN ----------------
 async def main():
-    await monitor()
+    t = threading.Thread(target=run_flask)
+    t.start()
 
-client.loop.run_until_complete(main())
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("watchlist_add", watchlist_add))
+    app.add_handler(CommandHandler("watchlist_remove", watchlist_remove))
+    app.add_handler(CommandHandler("watchlist_show", watchlist_show))
+    app.add_handler(CommandHandler("newcoins", newcoins))
+    app.add_handler(CommandHandler("info", token_info))
+
+    # Background tasks
+    from asyncio import create_task
+    app.job_queue.run_repeating(lambda ctx: create_task(presale_alert_task(app)), interval=CHECK_INTERVAL, first=10)
+    app.job_queue.run_repeating(lambda ctx: create_task(price_alert_task(app.bot)), interval=PRICE_CHECK_INTERVAL, first=15)
+
+    print("🤖 MemeCoin Scout Bot is running with presale & price alerts, keep-alive enabled.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
