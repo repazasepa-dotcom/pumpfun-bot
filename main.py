@@ -147,9 +147,8 @@ async def main():
     import threading
     from asyncio import create_task
 
-    # Start Flask keep-alive
-    t = threading.Thread(target=run_flask)
-    t.start()
+    # Start Flask keep-alive first
+    threading.Thread(target=run_flask, daemon=True).start()
 
     # Build Telegram Bot
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -162,18 +161,16 @@ async def main():
     app.add_handler(CommandHandler("newcoins", newcoins))
     app.add_handler(CommandHandler("info", token_info))
 
-    # Initialize app to create job_queue
-    await app.initialize()
+    # Start bot (job_queue is created here)
+    await app.start()
+    await app.updater.start_polling()
 
-    # Schedule repeating tasks
+    # Now job_queue exists — schedule tasks
     app.job_queue.run_repeating(lambda ctx: create_task(send_presale_alerts(app.bot)), interval=CHECK_INTERVAL, first=10)
     app.job_queue.run_repeating(lambda ctx: create_task(price_alert_task(app.bot)), interval=PRICE_CHECK_INTERVAL, first=15)
 
-    # Start polling
-    print("🤖 Bot starting...")
-    await app.start()
-    await app.updater.start_polling()
-    print("✅ Bot started polling")
+    print("🤖 Bot running, alerts scheduled.")
+
     await app.idle()
 
 if __name__ == "__main__":
