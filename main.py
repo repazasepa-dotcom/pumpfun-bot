@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-Solana Meme Coin Pro Watcher -> Telegram
+Meme Pro Watcher + Keep-Alive + X/Twitter Hype
 
-Features:
-- Watches new Solana pools on GeckoTerminal
-- Filters tokens with Volume >= $50k
-- Tracks holder growth on-chain (Solscan)
-- Posts formatted alerts to Telegram channel
+- Detects new Solana meme coins (GeckoTerminal)
+- Volume >= $50k
+- Tracks holder growth (Solscan)
+- Estimates Twitter/X hype (Nitter)
+- Posts high-score coins to Telegram
+- Runs 24/7 with Flask keep-alive
 """
 
 import os
 import json
 import asyncio
-import aiohttp
-import time
 from datetime import datetime
+import aiohttp
 from telethon import TelegramClient
+from flask import Flask
+import threading
+import time
 
 # ---------------------------
 # Config
@@ -25,13 +28,31 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DEST_CHANNEL = os.getenv("DEST_CHANNEL", "@PumpFunMemeCoinAlert")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # in seconds
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))
 MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "50000"))
 MIN_HOLDERS = int(os.getenv("MIN_HOLDERS", "50"))
+NITTER_MENTIONS_THRESHOLD = int(os.getenv("NITTER_MENTIONS_THRESHOLD", "50"))
+POST_SCORE_THRESHOLD = int(os.getenv("POST_SCORE_THRESHOLD", "3"))
 SEEN_STORE = os.getenv("SEEN_STORE", "seen_tokens.json")
 
 # ---------------------------
-# Utilities
+# Flask Keep-Alive
+# ---------------------------
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ Meme Pro Bot Running!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 Keep-alive web server running on port {port}")
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web, daemon=True).start()
+
+# ---------------------------
+# Seen tokens store
 # ---------------------------
 def load_seen():
     if os.path.exists(SEEN_STORE):
@@ -58,7 +79,7 @@ async def send_telegram_message(text):
         print("Telegram send error:", e)
 
 # ---------------------------
-# Fetch new pools from GeckoTerminal
+# GeckoTerminal fetcher
 # ---------------------------
 async def fetch_geckoterminal_new_pools(session):
     url = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
@@ -92,7 +113,28 @@ async def get_holder_count_solscan(session, token_address):
         return 0
 
 # ---------------------------
-# Score token based on holder growth + volume
+# Twitter/X hype estimate via Nitter
+# ---------------------------
+async def nitter_mentions_count(session, query):
+    q = query.replace(" ", "+")
+    url = f"https://nitter.net/search?f=tweets&q={q}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MemeWatcher/1.0)"}
+    try:
+        async with session.get(url, headers=headers, timeout=15) as resp:
+            if resp.status != 200:
+                return 0
+            text = await resp.text()
+            count = text.count('<div class="tweet')
+            if count == 0:
+                count = text.count('class="timeline-item"')
+            if count == 0:
+                count = text.count('/status/')
+            return count
+    except:
+        return 0
+
+# ---------------------------
+# Score token
 # ---------------------------
 async def score_token(session, pool_record):
     attr = pool_record.get("attributes", {}) if isinstance(pool_record, dict) else {}
@@ -110,10 +152,17 @@ async def score_token(session, pool_record):
     if token_address:
         holders = await get_holder_count_solscan(session, token_address)
 
+    mentions = 0
+    query = token_symbol or token_name
+    if query:
+        mentions = await nitter_mentions_count(session, query)
+
     score = 0
     if volume >= MIN_VOLUME_USD:
         score += 1
     if holders >= MIN_HOLDERS:
+        score += 1
+    if mentions >= NITTER_MENTIONS_THRESHOLD:
         score += 1
 
     return {
@@ -123,12 +172,13 @@ async def score_token(session, pool_record):
         "pool": pool_address,
         "volume": volume,
         "holders": holders,
+        "mentions": mentions,
         "score": score,
         "raw": pool_record
     }
 
 # ---------------------------
-# Format message
+# Message formatter
 # ---------------------------
 def build_message(info):
     name = info.get("name") or "-"
@@ -137,6 +187,7 @@ def build_message(info):
     pool = info.get("pool") or "-"
     vol = info.get("volume") or 0
     holders = info.get("holders") or 0
+    mentions = info.get("mentions") or 0
     score = info.get("score") or 0
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     solscan = f"https://solscan.io/token/{addr}" if addr else ""
@@ -146,7 +197,8 @@ f"🚀 *New Solana Meme Coin*\n\n"
 f"*{name}* `{sym}`\n"
 f"• Score: {score}\n"
 f"• Volume: ${vol:,.0f}\n"
-f"• Holders: {holders}\n\n"
+f"• Holders: {holders}\n"
+f"• Mentions (est): {mentions}\n\n"
 f"• Chart: {chart}\n"
 f"• Token: {solscan}\n\n"
 f"_Detected at {ts}_"
@@ -154,7 +206,7 @@ f"_Detected at {ts}_"
     return msg
 
 # ---------------------------
-# Main loop
+# Main polling loop
 # ---------------------------
 async def poll_loop():
     seen = load_seen()
@@ -176,7 +228,7 @@ async def poll_loop():
                     addr = (info.get("address") or "").lower()
                     if not addr or addr in seen:
                         continue
-                    if info.get("score", 0) >= 1:
+                    if info.get("score", 0) >= POST_SCORE_THRESHOLD:
                         candidates.append(info)
                 candidates.sort(key=lambda x: (x.get("score",0), x.get("volume",0)), reverse=True)
                 for cand in candidates:
@@ -193,7 +245,7 @@ async def poll_loop():
 # Entrypoint
 # ---------------------------
 async def main():
-    print("Starting Meme Pro Watcher. Posting to:", DEST_CHANNEL)
+    print("Starting Meme Pro Bot with Keep-Alive. Posting to:", DEST_CHANNEL)
     await client.start(bot_token=BOT_TOKEN)
     await poll_loop()
 
