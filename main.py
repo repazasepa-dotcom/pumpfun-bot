@@ -1,138 +1,204 @@
-# main.py
+#!/usr/bin/env python3
+"""
+Solana Meme Coin Pro Watcher -> Telegram
+
+Features:
+- Watches new Solana pools on GeckoTerminal
+- Filters tokens with Volume >= $50k
+- Tracks holder growth on-chain (Solscan)
+- Posts formatted alerts to Telegram channel
+"""
+
 import os
+import json
 import asyncio
-import requests
-from flask import Flask
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import aiohttp
+import time
+from datetime import datetime
+from telethon import TelegramClient
 
-# ---------------- ENV VARIABLES ----------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@PumpFunMemeCoinAlert")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
-PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", "300"))
+# ---------------------------
+# Config
+# ---------------------------
+TELETHON_SESSION = os.getenv("TELETHON_SESSION", "meme_pro_session")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DEST_CHANNEL = os.getenv("DEST_CHANNEL", "@PumpFunMemeCoinAlert")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # in seconds
+MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "50000"))
+MIN_HOLDERS = int(os.getenv("MIN_HOLDERS", "50"))
+SEEN_STORE = os.getenv("SEEN_STORE", "seen_tokens.json")
 
-# ---------------- DATA ----------------
-last_presales = []
-previous_prices = {}
-
-# ---------------- FLASK KEEP-ALIVE ----------------
-app_flask = Flask("KeepAlive")
-
-@app_flask.route("/")
-def home():
-    return "Bot is alive!"
-
-def run_flask():
-    app_flask.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
-
-# ---------------- HELPER FUNCTIONS ----------------
-def get_presales():
-    presales = []
-    try:
-        data = requests.get("https://api.pinksale.finance/api/v1/presales", timeout=10).json()
-        for item in data:
-            presale_id = item["id"]
-            if not any(p["id"] == presale_id for p in last_presales):
-                presale = {
-                    "id": presale_id,
-                    "name": item["name"],
-                    "url": item["website"],
-                    "status": item["status"],
-                    "coin_id": item["token_symbol"].lower(),
-                    "token_contract": item["tokenAddress"],
-                    "lp_contract": item.get("lpAddress"),
-                    "lock_address": item.get("lockAddress"),
-                }
-                presales.append(presale)
-                last_presales.append(presale)
-    except Exception as e:
-        print("Presale fetch error:", e)
-    return presales
-
-def get_community_score(coin_id: str):
-    # Option B: no Telethon, simplified scoring
-    # Example: static score or based on coin_id length
-    return min(100, len(coin_id) * 10)
-
-# ---------------- ALERTS ----------------
-async def send_presale_alerts(bot):
-    presales = get_presales()
-    for p in presales:
-        score = get_community_score(p["coin_id"])
-        msg = (
-            f"🚀 *New Meme Coin Presale!*\n\n"
-            f"*Name:* {p['name']}\n"
-            f"*Status:* {p['status']}\n"
-            f"*Contract:* [`{p['token_contract']}`](https://bscscan.com/token/{p['token_contract']})\n"
-            f"*Community Score:* {score}/100\n"
-            f"*Website:* [Link]({p['url']})"
-        )
+# ---------------------------
+# Utilities
+# ---------------------------
+def load_seen():
+    if os.path.exists(SEEN_STORE):
         try:
-            await bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
-        except Exception as e:
-            print("Alert send error:", e)
+            with open(SEEN_STORE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-async def price_alert_task(bot):
-    COINGECKO_API = "https://api.coingecko.com/api/v3/simple/token_price/binance-smart-chain"
-    while True:
-        for p in last_presales:
-            try:
-                token = p["token_contract"]
-                price = requests.get(COINGECKO_API, params={"contract_addresses": token, "vs_currencies": "usd"}, timeout=10).json().get(token.lower(), {}).get("usd")
-                if price is None:
-                    continue
-                old = previous_prices.get(token)
-                if old is None:
-                    previous_prices[token] = price
-                    continue
-                change = ((price - old) / old) * 100
-                if abs(change) >= 10:
-                    msg = (
-                        f"📈 *Price Alert!* {p['name']} ({p['coin_id']})\n"
-                        f"Price: ${price:.6f} ({change:+.2f}%)\n"
-                        f"[Contract](https://bscscan.com/token/{token})"
-                    )
-                    await bot.send_message(CHANNEL_ID, msg, parse_mode="Markdown")
-                    previous_prices[token] = price
-            except Exception as e:
-                print("Price alert error:", e)
-        await asyncio.sleep(PRICE_CHECK_INTERVAL)
+def save_seen(d):
+    with open(SEEN_STORE, "w") as f:
+        json.dump(d, f, indent=2)
 
-# ---------------- COMMANDS ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚀 MemeCoin Scout Bot\n"
-        "/newcoins"
+# ---------------------------
+# Telegram Client
+# ---------------------------
+client = TelegramClient(TELETHON_SESSION, API_ID, API_HASH)
+
+async def send_telegram_message(text):
+    try:
+        await client.send_message(DEST_CHANNEL, text, parse_mode="markdown")
+    except Exception as e:
+        print("Telegram send error:", e)
+
+# ---------------------------
+# Fetch new pools from GeckoTerminal
+# ---------------------------
+async def fetch_geckoterminal_new_pools(session):
+    url = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+    try:
+        async with session.get(url, timeout=20) as resp:
+            if resp.status != 200:
+                print("GeckoTerminal status:", resp.status)
+                return []
+            data = await resp.json()
+            return data.get("data", [])
+    except Exception as e:
+        print("GeckoTerminal fetch error:", e)
+        return []
+
+# ---------------------------
+# Holder count via Solscan
+# ---------------------------
+async def get_holder_count_solscan(session, token_address):
+    url = f"https://public-api.solscan.io/token/meta?tokenAddress={token_address}"
+    try:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status != 200:
+                return 0
+            j = await resp.json()
+            holders = j.get("holder") or j.get("holders") or j.get("holderCount") or 0
+            if not holders and isinstance(j.get("data"), dict):
+                d = j.get("data")
+                holders = d.get("holder") or d.get("holders") or d.get("holderCount") or 0
+            return int(holders or 0)
+    except:
+        return 0
+
+# ---------------------------
+# Score token based on holder growth + volume
+# ---------------------------
+async def score_token(session, pool_record):
+    attr = pool_record.get("attributes", {}) if isinstance(pool_record, dict) else {}
+    token_address = attr.get("base_token_address") or ""
+    token_symbol = attr.get("base_token_symbol") or ""
+    token_name = attr.get("base_token_name") or ""
+    pool_address = attr.get("address") or ""
+    volume = 0.0
+    try:
+        volume = float(attr.get("volume_usd") or attr.get("volume") or 0)
+    except:
+        volume = 0.0
+
+    holders = 0
+    if token_address:
+        holders = await get_holder_count_solscan(session, token_address)
+
+    score = 0
+    if volume >= MIN_VOLUME_USD:
+        score += 1
+    if holders >= MIN_HOLDERS:
+        score += 1
+
+    return {
+        "address": token_address,
+        "symbol": token_symbol,
+        "name": token_name,
+        "pool": pool_address,
+        "volume": volume,
+        "holders": holders,
+        "score": score,
+        "raw": pool_record
+    }
+
+# ---------------------------
+# Format message
+# ---------------------------
+def build_message(info):
+    name = info.get("name") or "-"
+    sym = info.get("symbol") or "-"
+    addr = info.get("address") or "-"
+    pool = info.get("pool") or "-"
+    vol = info.get("volume") or 0
+    holders = info.get("holders") or 0
+    score = info.get("score") or 0
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    solscan = f"https://solscan.io/token/{addr}" if addr else ""
+    chart = f"https://www.geckoterminal.com/solana/pools/{pool}" if pool else ""
+    msg = (
+f"🚀 *New Solana Meme Coin*\n\n"
+f"*{name}* `{sym}`\n"
+f"• Score: {score}\n"
+f"• Volume: ${vol:,.0f}\n"
+f"• Holders: {holders}\n\n"
+f"• Chart: {chart}\n"
+f"• Token: {solscan}\n\n"
+f"_Detected at {ts}_"
     )
+    return msg
 
-async def newcoins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    presales = get_presales()
-    if not presales:
-        await update.message.reply_text("No new presales.")
-        return
-    msg = "🆕 Latest Presales:\n" + "\n".join([f"{p['name']} ({p['coin_id']}) - {p['url']}" for p in presales[:5]])
-    await update.message.reply_text(msg)
+# ---------------------------
+# Main loop
+# ---------------------------
+async def poll_loop():
+    seen = load_seen()
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                print(f"[{datetime.utcnow().isoformat()}] Checking GeckoTerminal new pools...")
+                pools = await fetch_geckoterminal_new_pools(session)
+                candidates = []
+                for p in pools:
+                    attr = p.get("attributes", {}) if isinstance(p, dict) else {}
+                    try:
+                        vol = float(attr.get("volume_usd") or attr.get("volume") or 0)
+                    except:
+                        vol = 0
+                    if vol < MIN_VOLUME_USD:
+                        continue
+                    info = await score_token(session, p)
+                    addr = (info.get("address") or "").lower()
+                    if not addr or addr in seen:
+                        continue
+                    if info.get("score", 0) >= 1:
+                        candidates.append(info)
+                candidates.sort(key=lambda x: (x.get("score",0), x.get("volume",0)), reverse=True)
+                for cand in candidates:
+                    msg = build_message(cand)
+                    await send_telegram_message(msg)
+                    seen[cand["address"].lower()] = datetime.utcnow().isoformat()
+                    save_seen(seen)
+                    await asyncio.sleep(1.5)
+            except Exception as e:
+                print("Main loop error:", e)
+            await asyncio.sleep(POLL_INTERVAL)
 
-# ---------------- MAIN ----------------
+# ---------------------------
+# Entrypoint
+# ---------------------------
 async def main():
-    # Start Flask keep-alive
-    import threading
-    threading.Thread(target=run_flask).start()
-
-    # Telegram bot
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Add commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("newcoins", newcoins))
-
-    # Schedule jobs
-    app.create_task(send_presale_alerts(app.bot))
-    app.create_task(price_alert_task(app.bot))
-
-    print("🤖 Bot running with Option B, Python-telegram-bot v20-ready.")
-    await app.run_polling()
+    print("Starting Meme Pro Watcher. Posting to:", DEST_CHANNEL)
+    await client.start(bot_token=BOT_TOKEN)
+    await poll_loop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopped by user.")
