@@ -1,256 +1,162 @@
 #!/usr/bin/env python3
-"""
-Meme Pro Watcher + Keep-Alive + X/Twitter Hype
-
-- Detects new Solana meme coins (GeckoTerminal)
-- Volume >= $50k
-- Tracks holder growth (Solscan)
-- Estimates Twitter/X hype (Nitter)
-- Posts high-score coins to Telegram
-- Runs 24/7 with Flask keep-alive
-"""
-
-import os
-import json
-import asyncio
-from datetime import datetime
-import aiohttp
-from telethon import TelegramClient
+import os, time, json, requests, threading, datetime, asyncio
 from flask import Flask
-import threading
-import time
+from telethon import TelegramClient
 
-# ---------------------------
-# Config
-# ---------------------------
-TELETHON_SESSION = os.getenv("TELETHON_SESSION", "meme_pro_session")
+# -----------------------------
+# ENV VARS / SETTINGS
+# -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-DEST_CHANNEL = os.getenv("DEST_CHANNEL", "@PumpFunMemeCoinAlert")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))
-MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "50000"))
-MIN_HOLDERS = int(os.getenv("MIN_HOLDERS", "50"))
-NITTER_MENTIONS_THRESHOLD = int(os.getenv("NITTER_MENTIONS_THRESHOLD", "50"))
-POST_SCORE_THRESHOLD = int(os.getenv("POST_SCORE_THRESHOLD", "3"))
-SEEN_STORE = os.getenv("SEEN_STORE", "seen_tokens.json")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "YOUR_TELEGRAM_CHANNEL_ID")
 
-# ---------------------------
-# Flask Keep-Alive
-# ---------------------------
+SOLANA_RPC = os.getenv("SOL_RPC", "https://api.mainnet-beta.solana.com")
+
+client = TelegramClient("session", API_ID, API_HASH)
+holder_history = {}  # {mint: {"first": int, "time": timestamp}}
+
+# -----------------------------
+# GET HOLDER COUNT
+# -----------------------------
+def get_holder_count(mint):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenLargestAccounts",
+        "params": [mint]
+    }
+    try:
+        res = requests.post(SOLANA_RPC, json=payload, timeout=10).json()
+        if "result" not in res: return None
+        accounts = res["result"]["value"]
+        holders = sum(1 for a in accounts if float(a["amount"]) > 0)
+        return holders
+    except:
+        return None
+
+
+# -----------------------------
+# SEND TELEGRAM MESSAGE
+# -----------------------------
+async def send_telegram(msg):
+    try:
+        await client.send_message(CHANNEL_ID, msg, link_preview=False)
+    except Exception as e:
+        print("Telegram Error:", e)
+
+
+# -----------------------------
+# FETCH NEW POOLS FROM GECKOTERMINAL
+# -----------------------------
+def get_new_pools():
+    url = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+    try:
+        r = requests.get(url, timeout=10).json()
+        return r["data"]
+    except:
+        return []
+
+
+# -----------------------------
+# ANALYZE TOKEN
+# -----------------------------
+async def analyze_token(pool):
+    try:
+        token = pool["attributes"]
+        mint = token["base_token_address"]
+        name = token["base_token_name"]
+        symbol = token["base_token_symbol"]
+        volume = float(token.get("volume_usd", 0))
+
+        # Volume filter
+        if volume < 50000:
+            print(f"⛔ {symbol} low volume: {volume}")
+            return
+
+        print(f"\n🎯 New Token: {name} ({symbol}) | Mint: {mint} | Volume: ${volume:,.0f}")
+
+        holders = get_holder_count(mint)
+        if holders is None:
+            print("⚠️ Could not fetch holders")
+            return
+
+        # Initialize first time seen
+        if mint not in holder_history:
+            holder_history[mint] = {"first": holders, "time": time.time()}
+            print(f"🌱 Tracking {symbol} | Initial holders: {holders}")
+            return
+
+        # Calculate growth
+        initial = holder_history[mint]["first"]
+        elapsed = time.time() - holder_history[mint]["time"]
+        growth = holders - initial
+        growth_per_min = growth / (elapsed / 60) if elapsed > 60 else growth
+
+        print(f"📈 {symbol} Holders: {holders} | +{growth} | {growth_per_min:.2f}/min")
+
+        # Filters
+        if holders < 100 or holders > 800:
+            print("❌ Holders out of target range")
+            return
+
+        if growth < 20 or growth_per_min < 10:
+            print("❌ Weak growth — skipping")
+            return
+
+        # ✅ Strong coin alert
+        msg = f"""
+🔥 *Meme Coin Momentum Alert*
+
+*Name:* {name} ({symbol})
+*Mint:* `{mint}`
+
+*Volume:* ${volume:,.0f}
+*Holders:* {holders}
+*Initial:* {initial}
+*Growth:* +{growth}
+*Speed:* {growth_per_min:.1f}/min
+
+[View Chart](https://www.geckoterminal.com/solana/tokens/{mint})
+"""
+        await send_telegram(msg)
+        print(f"✅ Alert sent for {symbol}")
+
+    except Exception as e:
+        print("Analyze Error:", e)
+
+
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
+async def monitor():
+    await client.start(bot_token=BOT_TOKEN)
+
+    while True:
+        print(f"[{datetime.datetime.utcnow().isoformat()}] Checking GeckoTerminal new pools...")
+        pools = get_new_pools()
+        for p in pools:
+            await analyze_token(p)
+        await asyncio.sleep(120)  # check every 2 min
+
+
+# -----------------------------
+# FLASK KEEP ALIVE
+# -----------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ Meme Pro Bot Running!"
+    return "✅ Meme bot running"
 
 def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 Keep-alive web server running on port {port}")
+    port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-threading.Thread(target=run_web, daemon=True).start()
 
-# ---------------------------
-# Seen tokens store
-# ---------------------------
-def load_seen():
-    if os.path.exists(SEEN_STORE):
-        try:
-            with open(SEEN_STORE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_seen(d):
-    with open(SEEN_STORE, "w") as f:
-        json.dump(d, f, indent=2)
-
-# ---------------------------
-# Telegram Client
-# ---------------------------
-client = TelegramClient(TELETHON_SESSION, API_ID, API_HASH)
-
-async def send_telegram_message(text):
-    try:
-        await client.send_message(DEST_CHANNEL, text, parse_mode="markdown")
-    except Exception as e:
-        print("Telegram send error:", e)
-
-# ---------------------------
-# GeckoTerminal fetcher
-# ---------------------------
-async def fetch_geckoterminal_new_pools(session):
-    url = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
-    try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status != 200:
-                print("GeckoTerminal status:", resp.status)
-                return []
-            data = await resp.json()
-            return data.get("data", [])
-    except Exception as e:
-        print("GeckoTerminal fetch error:", e)
-        return []
-
-# ---------------------------
-# Holder count via Solscan
-# ---------------------------
-async def get_holder_count_solscan(session, token_address):
-    url = f"https://public-api.solscan.io/token/meta?tokenAddress={token_address}"
-    try:
-        async with session.get(url, timeout=10) as resp:
-            if resp.status != 200:
-                return 0
-            j = await resp.json()
-            holders = j.get("holder") or j.get("holders") or j.get("holderCount") or 0
-            if not holders and isinstance(j.get("data"), dict):
-                d = j.get("data")
-                holders = d.get("holder") or d.get("holders") or d.get("holderCount") or 0
-            return int(holders or 0)
-    except:
-        return 0
-
-# ---------------------------
-# Twitter/X hype estimate via Nitter
-# ---------------------------
-async def nitter_mentions_count(session, query):
-    q = query.replace(" ", "+")
-    url = f"https://nitter.net/search?f=tweets&q={q}"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; MemeWatcher/1.0)"}
-    try:
-        async with session.get(url, headers=headers, timeout=15) as resp:
-            if resp.status != 200:
-                return 0
-            text = await resp.text()
-            count = text.count('<div class="tweet')
-            if count == 0:
-                count = text.count('class="timeline-item"')
-            if count == 0:
-                count = text.count('/status/')
-            return count
-    except:
-        return 0
-
-# ---------------------------
-# Score token
-# ---------------------------
-async def score_token(session, pool_record):
-    attr = pool_record.get("attributes", {}) if isinstance(pool_record, dict) else {}
-    token_address = attr.get("base_token_address") or ""
-    token_symbol = attr.get("base_token_symbol") or ""
-    token_name = attr.get("base_token_name") or ""
-    pool_address = attr.get("address") or ""
-    volume = 0.0
-    try:
-        volume = float(attr.get("volume_usd") or attr.get("volume") or 0)
-    except:
-        volume = 0.0
-
-    holders = 0
-    if token_address:
-        holders = await get_holder_count_solscan(session, token_address)
-
-    mentions = 0
-    query = token_symbol or token_name
-    if query:
-        mentions = await nitter_mentions_count(session, query)
-
-    score = 0
-    if volume >= MIN_VOLUME_USD:
-        score += 1
-    if holders >= MIN_HOLDERS:
-        score += 1
-    if mentions >= NITTER_MENTIONS_THRESHOLD:
-        score += 1
-
-    return {
-        "address": token_address,
-        "symbol": token_symbol,
-        "name": token_name,
-        "pool": pool_address,
-        "volume": volume,
-        "holders": holders,
-        "mentions": mentions,
-        "score": score,
-        "raw": pool_record
-    }
-
-# ---------------------------
-# Message formatter
-# ---------------------------
-def build_message(info):
-    name = info.get("name") or "-"
-    sym = info.get("symbol") or "-"
-    addr = info.get("address") or "-"
-    pool = info.get("pool") or "-"
-    vol = info.get("volume") or 0
-    holders = info.get("holders") or 0
-    mentions = info.get("mentions") or 0
-    score = info.get("score") or 0
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    solscan = f"https://solscan.io/token/{addr}" if addr else ""
-    chart = f"https://www.geckoterminal.com/solana/pools/{pool}" if pool else ""
-    msg = (
-f"🚀 *New Solana Meme Coin*\n\n"
-f"*{name}* `{sym}`\n"
-f"• Score: {score}\n"
-f"• Volume: ${vol:,.0f}\n"
-f"• Holders: {holders}\n"
-f"• Mentions (est): {mentions}\n\n"
-f"• Chart: {chart}\n"
-f"• Token: {solscan}\n\n"
-f"_Detected at {ts}_"
-    )
-    return msg
-
-# ---------------------------
-# Main polling loop
-# ---------------------------
-async def poll_loop():
-    seen = load_seen()
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                print(f"[{datetime.utcnow().isoformat()}] Checking GeckoTerminal new pools...")
-                pools = await fetch_geckoterminal_new_pools(session)
-                candidates = []
-                for p in pools:
-                    attr = p.get("attributes", {}) if isinstance(p, dict) else {}
-                    try:
-                        vol = float(attr.get("volume_usd") or attr.get("volume") or 0)
-                    except:
-                        vol = 0
-                    if vol < MIN_VOLUME_USD:
-                        continue
-                    info = await score_token(session, p)
-                    addr = (info.get("address") or "").lower()
-                    if not addr or addr in seen:
-                        continue
-                    if info.get("score", 0) >= POST_SCORE_THRESHOLD:
-                        candidates.append(info)
-                candidates.sort(key=lambda x: (x.get("score",0), x.get("volume",0)), reverse=True)
-                for cand in candidates:
-                    msg = build_message(cand)
-                    await send_telegram_message(msg)
-                    seen[cand["address"].lower()] = datetime.utcnow().isoformat()
-                    save_seen(seen)
-                    await asyncio.sleep(1.5)
-            except Exception as e:
-                print("Main loop error:", e)
-            await asyncio.sleep(POLL_INTERVAL)
-
-# ---------------------------
-# Entrypoint
-# ---------------------------
-async def main():
-    print("Starting Meme Pro Bot with Keep-Alive. Posting to:", DEST_CHANNEL)
-    await client.start(bot_token=BOT_TOKEN)
-    await poll_loop()
-
+# -----------------------------
+# START
+# -----------------------------
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Stopped by user.")
+    threading.Thread(target=run_web, daemon=True).start()
+    asyncio.run(monitor())
