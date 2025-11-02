@@ -130,13 +130,12 @@ async def analyze_token(pool):
 # MAIN LOOP
 # -----------------------------
 async def monitor():
-    await client.start(bot_token=BOT_TOKEN)
+    async def monitor():
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.start(bot_token=BOT_TOKEN)
 
-    await client.start(bot_token=BOT_TOKEN)
-
-    # Test messages to confirm bot connection & channel ID
-    await client.send_message(CHANNEL_ID, "🔧 Test message: Bot connected ✅")
-    await send_telegram("✅ Bot is running and monitoring GeckoTerminal.")
+    await send_telegram("✅ Bot started and monitoring GeckoTerminal ✅")
 
     while True:
         print(f"[{datetime.datetime.utcnow().isoformat()}] Checking GeckoTerminal new pools...")
