@@ -130,14 +130,18 @@ async def monitor():
     if not await client.is_user_authorized():
         await client.start(bot_token=BOT_TOKEN)
 
-    await send_telegram("✅ Bot started and monitoring GeckoTerminal ✅")
+    # ✅ Send a startup message safely
+    try:
+        await send_telegram("✅ Bot started and monitoring GeckoTerminal ✅")
+    except Exception as e:
+        print("Startup message failed:", e)
 
     while True:
-        print(f"[{datetime.datetime.utcnow().isoformat()}] Checking GeckoTerminal new pools...")
+        print(f"[{datetime.datetime.now().isoformat()}] Checking GeckoTerminal new pools...")
         pools = get_new_pools()
         for p in pools:
             await analyze_token(p)
-        await asyncio.sleep(120)  # check every 2 min
+        await asyncio.sleep(120)  # check every 2 minutes
 
 # -----------------------------
 # FLASK KEEP ALIVE
