@@ -35,7 +35,6 @@ def get_holder_count(mint):
     except:
         return None
 
-
 # -----------------------------
 # SEND TELEGRAM MESSAGE
 # -----------------------------
@@ -44,7 +43,6 @@ async def send_telegram(msg):
         await client.send_message(CHANNEL_ID, msg, link_preview=False)
     except Exception as e:
         print("Telegram Error:", e)
-
 
 # -----------------------------
 # FETCH NEW POOLS FROM GECKOTERMINAL
@@ -56,7 +54,6 @@ def get_new_pools():
         return r["data"]
     except:
         return []
-
 
 # -----------------------------
 # ANALYZE TOKEN
@@ -125,12 +122,10 @@ async def analyze_token(pool):
     except Exception as e:
         print("Analyze Error:", e)
 
-
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
 async def monitor():
-    async def monitor():
     await client.connect()
     if not await client.is_user_authorized():
         await client.start(bot_token=BOT_TOKEN)
@@ -144,7 +139,6 @@ async def monitor():
             await analyze_token(p)
         await asyncio.sleep(120)  # check every 2 min
 
-
 # -----------------------------
 # FLASK KEEP ALIVE
 # -----------------------------
@@ -157,7 +151,6 @@ def home():
 def run_web():
     port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
 
 # -----------------------------
 # START
