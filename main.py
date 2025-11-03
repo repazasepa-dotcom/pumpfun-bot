@@ -1,116 +1,95 @@
-import os, time, requests, asyncio
-from telethon import TelegramClient, events
-from flask import Flask
+# main.py
+import os, time, json, requests, asyncio
+from aiohttp import web
+from telethon import TelegramClient
 
-# -----------------------------
-# ENV VARIABLES
-# -----------------------------
+# -------------------- ENV --------------------
 API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL = os.getenv("CHANNEL")  # @channel or channel ID
+API_HASH = os.getenv("API_HASH"))
+BOT_TOKEN = os.getenv("BOT_TOKEN"))
+CHANNEL = os.getenv("CHANNEL"))  # @channel or ID
+PORT = int(os.getenv("PORT", "10000"))
 
-GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools?include=base_token"
-POLL_DELAY = 10
+GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
+POLL = 10
 
 seen = {}
+client = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# -----------------------------
-# TELEGRAM BOT
-# -----------------------------
-client = TelegramClient("gecko_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-
-async def send_msg(text):
+# -------------------- SEND MESSAGE --------------------
+async def send(text):
     try:
         await client.send_message(CHANNEL, text)
-        print("✅ Alert sent")
+        print("✅ Sent")
     except Exception as e:
-        print("❌ Telegram Error:", e)
+        print("❌ Telegram error:", e)
 
-def fetch_pools():
-    r = requests.get(GECKO_URL, timeout=10)
-    return r.json().get("data", [])
+# -------------------- FETCH POOLS --------------------
+def fetch():
+    try:
+        r = requests.get(GECKO_URL, timeout=10)
+        return r.json().get("data", [])
+    except:
+        return []
 
-# -----------------------------
-# BOT COMMANDS
-# -----------------------------
-@client.on(events.NewMessage(pattern="/ping"))
-async def ping(event):
-    await event.reply("✅ Bot is running")
-
-# -----------------------------
-# MONITOR POOLS
-# -----------------------------
+# -------------------- MONITOR --------------------
 async def monitor():
-    print("✅ Solana Gem Hunter Bot Running...")
+    print("✅ Sol Gem Hunter running...")
 
     while True:
-        try:
-            pools = fetch_pools()
-        except Exception as e:
-            print("⚠️ API Error:", e)
-            await asyncio.sleep(POLL_DELAY)
-            continue
+        pools = fetch()
 
-        for pool in pools:
-            attr = pool.get("attributes", {})
+        for p in pools:
+            attr = p.get("attributes", {})
             token = attr.get("base_token_name")
             symbol = attr.get("base_token_symbol")
-            pool_id = pool.get("id")
+            pool_id = p.get("id")
 
-            # ✅ Fix volume field type (dict/string/float)
-            vol_raw = attr.get("volume_usd", 0)
-            if isinstance(vol_raw, dict):
-                vol = float(vol_raw.get("h24", 0) or 0)
-            else:
-                vol = float(vol_raw or 0)
+            # TX & Volume
+            tx = attr.get("txn_count") or 0
+            vol = attr.get("volume_usd") or 0
+            vol = float(vol) if isinstance(vol, (float, int, str)) else 0
 
-            tx = int(attr.get("txn_count", 0) or 0)
-
-            # ✅ First time seen
+            # First seen = store baseline
             if pool_id not in seen:
                 seen[pool_id] = tx
 
-                # 🆕 NEW TOKEN FILTER (Tx 0–1 + Volume < $5000)
+                # 🆕 NEW COIN FOUND
                 if tx <= 1 and vol <= 5000:
-                    await send_msg(
-                        f"🆕 **NEW SOL TOKEN FOUND**\n\n"
-                        f"💎 {symbol} ({token})\n"
-                        f"📈 Txns: {tx}\n"
-                        f"💰 Volume: ${vol:,.2f}\n"
-                        f"📊 Chart:\nhttps://www.geckoterminal.com/solana/pools/{pool_id}"
+                    await send(
+                        f"🆕 **New SOL Token**\n"
+                        f"{symbol} ({token})\n"
+                        f"💵 Volume: ${vol}\n"
+                        f"🧾 TX: {tx}\n"
+                        f"https://www.geckoterminal.com/solana/pools/{pool_id}"
                     )
                 continue
 
-            prev_tx = seen[pool_id]
+            prev = seen[pool_id]
 
-            # 🚨 VOLUME / TX SPIKE ALERT
-            if tx > prev_tx + 3:
-                await send_msg(
-                    f"🚨 **Volume Spike Detected!**\n\n"
-                    f"💎 {symbol} ({token})\n"
-                    f"📈 Txns: {tx} (+{tx-prev_tx})\n"
-                    f"💰 Volume: ${vol:,.2f}\n"
-                    f"📊 Chart:\nhttps://www.geckoterminal.com/solana/pools/{pool_id}"
+            # 📈 PUMP SIGNAL
+            if tx > prev and vol >= 5000:
+                await send(
+                    f"🚨 **Volume Spike**\n"
+                    f"{symbol} ({token})\n"
+                    f"TX: {tx} (+{tx-prev})\n"
+                    f"💵 Volume: ${vol}\n"
+                    f"https://www.geckoterminal.com/solana/pools/{pool_id}"
                 )
 
             seen[pool_id] = tx
 
-        await asyncio.sleep(POLL_DELAY)
+        await asyncio.sleep(POLL)
 
-# -----------------------------
-# KEEP ALIVE FOR RENDER
-# -----------------------------
-app = Flask(__name__)
-@app.route("/")
-def home():
-    return "✅ Solana Gecko Bot Running"
+# -------------------- WEB (Render keep-alive) --------------------
+async def home(request):
+    return web.Response(text="Bot alive ✅")
 
-async def start_bot():
-    await monitor()
+async def run_all():
+    asyncio.create_task(monitor())
+    app = web.Application()
+    app.router.add_get("/", home)
+    return app
 
-client.loop.create_task(start_bot())
-
-# Start web server
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    web.run_app(run_all(), host="0.0.0.0", port=PORT)
