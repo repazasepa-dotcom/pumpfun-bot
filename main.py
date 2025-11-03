@@ -15,7 +15,6 @@ GECKO_URL = os.getenv(
     "GECKO_POOLS_URL",
     "https://api.geckoterminal.com/api/v2/networks/solana/pools"
 )
-
 PORT = int(os.getenv("PORT", "8000"))
 HOST = "0.0.0.0"
 
@@ -36,15 +35,15 @@ async def post_to_channel(token, pool_id):
     symbol = token.get("symbol", "Unknown")
     name = token.get("name", "Unknown")
     base_token = token.get("base_token_symbol", "Unknown")
-    txns = token.get("txn_count") or token.get("txns") or 0
-    market_cap = token.get("market_cap_usd") or token.get("liquidity_usd") or 0
+    txns = int(token.get("txn_count") or token.get("txns") or 0)
+    market_cap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
 
     msg = (
         f"📢 New pool gaining momentum!\n"
         f"Token: {symbol} | {name}\n"
         f"Base Token: {base_token}\n"
         f"Transactions: {txns}\n"
-        f"Market Cap: ${market_cap}\n"
+        f"Market Cap: ${market_cap:,.2f}\n"
         f"Pool ID: {pool_id}"
     )
 
@@ -79,7 +78,9 @@ async def fetch_pools():
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("data", [])
-            return []
+            else:
+                print(f"⚠️ Failed to fetch pools, status: {resp.status}")
+                return []
     except Exception as e:
         print(f"⚠️ Exception fetching pools: {e}")
         return []
@@ -93,31 +94,29 @@ async def monitor_pools():
     while True:
         pools = await fetch_pools()
 
-        # Process new pools
-        for pool in pools:
-            token = pool.get("attributes", {})
-            pool_id = pool.get("id")
-            if not pool_id or pool_id in seen_pools:
-                continue
-
-            txns = token.get("txn_count") or token.get("txns") or 0
-            market_cap = token.get("market_cap_usd") or token.get("liquidity_usd") or 0
-
-            if txns >= 20 and market_cap >= 5000:
-                await post_to_channel(token, pool_id)
-                seen_pools.add(pool_id)
-            else:
-                pending_pools[pool_id] = token
-
         # Retry pending pools
         for pool_id in list(pending_pools.keys()):
             token = pending_pools[pool_id]
-            txns = token.get("txn_count") or token.get("txns") or 0
-            market_cap = token.get("market_cap_usd") or token.get("liquidity_usd") or 0
+            try:
+                txns = int(token.get("txn_count") or token.get("txns") or 0)
+                market_cap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
+            except (TypeError, ValueError):
+                continue
+
             if txns >= 20 and market_cap >= 5000:
                 await post_to_channel(token, pool_id)
                 seen_pools.add(pool_id)
                 del pending_pools[pool_id]
+
+        # Process new pools
+        for pool in pools:
+            token = pool.get("attributes", {})
+            pool_id = pool.get("id")
+            if not pool_id or pool_id in seen_pools or pool_id in pending_pools:
+                continue
+
+            # Add all new pools to pending
+            pending_pools[pool_id] = token
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -127,7 +126,7 @@ async def monitor_pools():
 async def handle_health(request):
     return web.Response(text="OK")
 
-async def create_app():
+async def on_startup(app):
     global _bot, _monitor_task, _client_session
     if TELEGRAM_BOT_TOKEN:
         _bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -137,17 +136,32 @@ async def create_app():
     # Send startup test message
     asyncio.create_task(send_startup_message())
 
-    # Start the monitor loop
+    # Start monitor loop
     loop = asyncio.get_event_loop()
     _monitor_task = loop.create_task(monitor_pools())
 
+async def on_cleanup(app):
+    global _monitor_task, _client_session
+    if _monitor_task:
+        _monitor_task.cancel()
+        try:
+            await _monitor_task
+        except asyncio.CancelledError:
+            pass
+    if _client_session:
+        await _client_session.close()
+    print("Clean shutdown complete.")
+
+def create_app():
     app = web.Application()
     app.router.add_get("/", handle_health)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
     return app
 
 # -----------------------------
 # MAIN ENTRY
 # -----------------------------
 if __name__ == "__main__":
-    # Do NOT use asyncio.run(); pass coroutine directly to web.run_app
-    web.run_app(create_app(), host=HOST, port=PORT)
+    app = create_app()
+    web.run_app(app, host=HOST, port=PORT)
