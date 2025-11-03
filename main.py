@@ -1,4 +1,3 @@
-# main.py
 import os
 import asyncio
 import aiohttp
@@ -12,74 +11,78 @@ TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 PORT = int(os.getenv("PORT", "10000"))
 GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
-POLL_DELAY = 10  # seconds
+POLL_DELAY = 10
 
 bot = Bot(TOKEN)
-seen_activity = {}  # pool_id -> last tx count seen
+seen_tx = {}  # track previous txn count
+
 
 # -----------------------------
-# Send Telegram Message
+# SEND TELEGRAM MESSAGE
 # -----------------------------
-async def alert(pool, txns, mcap):
-    symbol = pool.get("base_token_symbol", "Unknown")
-    name = pool.get("base_token_name", "Unknown")
-    pool_id = pool.get("id")
-
+async def send_alert(symbol, name, pool_id, txns, mcap):
     text = (
         f"🚨 **Pump Alert Detected!**\n\n"
         f"Token: {symbol} | {name}\n"
-        f"Txns spike: {txns}\n"
-        f"Market Cap: ${mcap}\n"
-        f"Pool: {pool_id}\n"
-        f"Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
+        f"New Txns: {txns}\n"
+        f"Market Cap: ${mcap:,.2f}\n"
+        f"Pool: `{pool_id}`\n\n"
+        f"🔗 Chart:\nhttps://www.geckoterminal.com/solana/pools/{pool_id}"
     )
 
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
-        print(f"✅ Alert sent for {symbol} ({pool_id})")
+        await asyncio.get_event_loop().run_in_executor(
+            None, bot.send_message, CHAT_ID, text, "Markdown"
+        )
+        print(f"✅ Alert sent: {symbol}")
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
+        print(f"❌ Telegram error:", e)
+
 
 # -----------------------------
-# Monitor pools
+# MONITOR GECKOTERMINAL
 # -----------------------------
 async def monitor():
-    session = aiohttp.ClientSession()
-    print("✅ Bot started — Watching all SOL tokens")
+    async with aiohttp.ClientSession() as session:
+        print("✅ Bot started — Tracking SOL pools...")
 
-    while True:
-        try:
-            async with session.get(GECKO_URL, timeout=15) as r:
-                data = await r.json()
-                pools = data.get("data", [])
-        except Exception as e:
-            print("⚠️ Error fetching Gecko:", e)
-            await asyncio.sleep(POLL_DELAY)
-            continue
-
-        for p in pools:
-            attrs = p.get("attributes", {})
-            pool_id = p.get("id")
-
-            txns = attrs.get("txn_count") or attrs.get("txns") or 0
-            mcap = attrs.get("market_cap_usd") or attrs.get("fdv_usd") or attrs.get("liquidity_usd") or 0
-
-            # first sight of pool, store tx count
-            if pool_id not in seen_activity:
-                seen_activity[pool_id] = txns
+        while True:
+            try:
+                async with session.get(GECKO_URL, timeout=10) as r:
+                    data = await r.json()
+                    pools = data.get("data", [])
+            except Exception as e:
+                print("⚠️ Error fetching Gecko:", e)
+                await asyncio.sleep(POLL_DELAY)
                 continue
 
-            # check for spike
-            prev = seen_activity[pool_id]
-            if txns > prev and txns >= 1 and mcap >= 0:
-                await alert(attrs, txns, round(mcap, 2))
+            for p in pools:
+                attrs = p.get("attributes", {})
+                pool_id = p.get("id")
 
-            seen_activity[pool_id] = txns
+                txns = int(attrs.get("txns", 0))
+                mcap = float(attrs.get("fdv_usd") or 0)
 
-        await asyncio.sleep(POLL_DELAY)
+                # skip if no value
+                if pool_id not in seen_tx:
+                    seen_tx[pool_id] = txns
+                    continue
+
+                prev = seen_tx[pool_id]
+
+                # alert on new volume signal
+                if txns > prev and txns >= 1:
+                    symbol = attrs.get("base_token_symbol", "Unknown")
+                    name = attrs.get("base_token_name", "Unknown")
+                    await send_alert(symbol, name, pool_id, txns, mcap)
+
+                seen_tx[pool_id] = txns
+
+            await asyncio.sleep(POLL_DELAY)
+
 
 # -----------------------------
-# Web endpoints (Render keep-alive)
+# RENDER KEEP-ALIVE
 # -----------------------------
 async def health(request):
     return web.Response(text="OK")
@@ -89,6 +92,7 @@ async def start_app():
     app = web.Application()
     app.router.add_get("/", health)
     return app
+
 
 if __name__ == "__main__":
     web.run_app(start_app(), host="0.0.0.0", port=PORT)
