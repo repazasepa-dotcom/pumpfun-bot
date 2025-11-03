@@ -80,7 +80,8 @@ async def fetch_pools():
                 data = await resp.json()
                 return data.get("data", [])
             return []
-    except:
+    except Exception as e:
+        print(f"⚠️ Exception fetching pools: {e}")
         return []
 
 # -----------------------------
@@ -88,6 +89,7 @@ async def fetch_pools():
 # -----------------------------
 async def monitor_pools():
     global seen_pools, pending_pools
+    print("✅ Bot monitor started and watching GeckoTerminal")
     while True:
         pools = await fetch_pools()
 
@@ -147,5 +149,5 @@ async def create_app():
 # MAIN ENTRY
 # -----------------------------
 if __name__ == "__main__":
-    app = asyncio.run(create_app())
-    web.run_app(app, host=HOST, port=PORT)
+    # Do NOT use asyncio.run(); pass coroutine directly to web.run_app
+    web.run_app(create_app(), host=HOST, port=PORT)
