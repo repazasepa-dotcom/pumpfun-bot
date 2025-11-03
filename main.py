@@ -4,15 +4,15 @@ from flask import Flask
 from telethon import TelegramClient
 
 # -----------------------------
-# ENV VARS / SETTINGS
+# ENVIRONMENT VARIABLES
 # -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # use @username for test channel
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # Use @username for test channel
 
 SOLANA_RPC = os.getenv("SOL_RPC", "https://api.mainnet-beta.solana.com")
-DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "True").lower() == "true"  # True for testing
 CHECK_INTERVAL = 10 if DEBUG_MODE else 120  # 10s for testing, 2min for production
 
 client = TelegramClient("session", API_ID, API_HASH)
@@ -58,7 +58,7 @@ def get_new_pools():
         return []
 
 # -----------------------------
-# ANALYZE TOKEN
+# ANALYZE TOKEN (TEST MODE: POST ALL)
 # -----------------------------
 async def analyze_token(pool):
     try:
@@ -67,11 +67,6 @@ async def analyze_token(pool):
         name = token["base_token_name"]
         symbol = token["base_token_symbol"]
         volume = float(token.get("volume_usd", 0))
-
-        # Volume filter
-        if volume < 50000:
-            print(f"⛔ {symbol} low volume: {volume}")
-            return
 
         print(f"\n🎯 New Token: {name} ({symbol}) | Mint: {mint} | Volume: ${volume:,.0f}")
 
@@ -84,35 +79,20 @@ async def analyze_token(pool):
         if mint not in holder_history:
             holder_history[mint] = {"first": holders, "time": time.time()}
             print(f"🌱 Tracking {symbol} | Initial holders: {holders}")
-            return
 
-        # Calculate growth
-        initial = holder_history[mint]["first"]
+        growth = holders - holder_history[mint]["first"]
         elapsed = time.time() - holder_history[mint]["time"]
-        growth = holders - initial
         growth_per_min = growth / (elapsed / 60) if elapsed > 60 else growth
 
-        print(f"📈 {symbol} Holders: {holders} | +{growth} | {growth_per_min:.2f}/min")
-
-        # Filters
-        if holders < 100 or holders > 800:
-            print("❌ Holders out of target range")
-            return
-
-        if growth < 20 or growth_per_min < 10:
-            print("❌ Weak growth — skipping")
-            return
-
-        # ✅ Strong coin alert
+        # ✅ Test mode: ignore all filters
         msg = f"""
-🔥 *Meme Coin Momentum Alert*
+🔥 *Meme Coin Test Alert*
 
 *Name:* {name} ({symbol})
 *Mint:* `{mint}`
 
 *Volume:* ${volume:,.0f}
 *Holders:* {holders}
-*Initial:* {initial}
 *Growth:* +{growth}
 *Speed:* {growth_per_min:.1f}/min
 
@@ -132,7 +112,7 @@ async def monitor():
     if not await client.is_user_authorized():
         await client.start(bot_token=BOT_TOKEN)
 
-    await send_telegram("✅ Bot started and monitoring GeckoTerminal ✅")
+    await send_telegram("✅ Bot started and monitoring GeckoTerminal (TEST MODE) ✅")
 
     while True:
         print(f"[{datetime.datetime.utcnow().isoformat()}] Checking GeckoTerminal new pools...")
@@ -148,7 +128,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ Meme bot running"
+    return "✅ Meme bot running (TEST MODE)"
 
 def run_web():
     port = int(os.getenv("PORT", 10000))
