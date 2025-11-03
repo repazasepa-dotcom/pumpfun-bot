@@ -10,19 +10,19 @@ from telegram import Bot
 # -----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")  # "@channelusername" or numeric chat id
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 15))  # seconds between checks
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 15))  # seconds
 GECKO_URL = os.getenv(
     "GECKO_POOLS_URL",
     "https://api.geckoterminal.com/api/v2/networks/solana/pools"
 )
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", 8000))
 HOST = "0.0.0.0"
 
 # -----------------------------
 # GLOBALS
 # -----------------------------
 seen_pools = set()
-pending_pools = dict()  # pool_id -> pool data for retry
+pending_pools = dict()  # pool_id -> token data
 _bot = None
 _client_session = None
 _monitor_task = None
@@ -47,14 +47,14 @@ async def post_to_channel(token, pool_id):
         f"Pool ID: {pool_id}"
     )
 
-    if _bot:
+    if _bot and TELEGRAM_CHAT_ID:
         try:
             await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         except Exception as e:
             print(f"⚠️ Failed to send Telegram message: {e}")
 
 # -----------------------------
-# SEND STARTUP TEST MESSAGE
+# STARTUP MESSAGE
 # -----------------------------
 async def send_startup_message():
     if _bot and TELEGRAM_CHAT_ID:
@@ -64,7 +64,7 @@ async def send_startup_message():
                 text="✅ Bot started successfully and is now monitoring GeckoTerminal!"
             )
         except Exception as e:
-            print(f"⚠️ Failed to send startup test message: {e}")
+            print(f"⚠️ Failed to send startup message: {e}")
 
 # -----------------------------
 # FETCH POOLS
@@ -79,7 +79,8 @@ async def fetch_pools():
                 data = await resp.json()
                 return data.get("data", [])
             return []
-    except:
+    except Exception as e:
+        print(f"⚠️ Exception fetching pools: {e}")
         return []
 
 # -----------------------------
@@ -87,6 +88,7 @@ async def fetch_pools():
 # -----------------------------
 async def monitor_pools():
     global seen_pools, pending_pools
+    print("✅ Bot monitor started and watching GeckoTerminal")
     while True:
         pools = await fetch_pools()
 
@@ -119,7 +121,7 @@ async def monitor_pools():
         await asyncio.sleep(POLL_INTERVAL)
 
 # -----------------------------
-# AIOHTTP WEB APP
+# AIOHTTP HANDLERS
 # -----------------------------
 async def handle_health(request):
     return web.Response(text="OK")
@@ -130,28 +132,47 @@ async def handle_metrics(request):
         "pending_pools_count": len(pending_pools)
     })
 
-async def create_app():
-    global _bot, _monitor_task, _client_session
+# -----------------------------
+# STARTUP & CLEANUP
+# -----------------------------
+async def on_startup(app):
+    global _bot, _client_session, _monitor_task
     if TELEGRAM_BOT_TOKEN:
         _bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
     _client_session = aiohttp.ClientSession()
 
-    # Send startup test message
+    # Send startup message
     asyncio.create_task(send_startup_message())
+    # Start monitoring
+    _monitor_task = asyncio.create_task(monitor_pools())
+    print("Startup complete.")
 
-    # Start the monitor loop
-    loop = asyncio.get_event_loop()
-    _monitor_task = loop.create_task(monitor_pools())
+async def on_cleanup(app):
+    global _client_session, _monitor_task
+    if _monitor_task:
+        _monitor_task.cancel()
+        try:
+            await _monitor_task
+        except asyncio.CancelledError:
+            pass
+    if _client_session:
+        await _client_session.close()
+    print("Clean shutdown complete.")
 
+# -----------------------------
+# CREATE APP
+# -----------------------------
+def create_app():
     app = web.Application()
     app.router.add_get("/", handle_health)
     app.router.add_get("/metrics", handle_metrics)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
     return app
 
 # -----------------------------
-# MAIN ENTRY
+# MAIN
 # -----------------------------
 if __name__ == "__main__":
-    app = asyncio.run(create_app())
+    app = create_app()
     web.run_app(app, host=HOST, port=PORT)
