@@ -1,95 +1,88 @@
-# main.py
-import os, time, json, requests, asyncio
-from aiohttp import web
+import os, time, requests, asyncio
+from datetime import datetime
 from telethon import TelegramClient
 
-# -------------------- ENV --------------------
 API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")  # ✅ fixed
+API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL = os.getenv("CHANNEL")  # @channel or ID
-PORT = int(os.getenv("PORT", "10000"))
+CHANNEL = os.getenv("CHANNEL")  # @channelusername or ID
 
-GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
-POLL = 10
+GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools?include=base_token"
+POLL_DELAY = 10
 
 seen = {}
+
 client = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# -------------------- SEND MESSAGE --------------------
-async def send(text):
+async def send_msg(text):
     try:
         await client.send_message(CHANNEL, text)
-        print("✅ Sent")
+        print("✅ Alert sent")
     except Exception as e:
-        print("❌ Telegram error:", e)
+        print(f"⚠️ Telegram Error: {e}")
 
-# -------------------- FETCH POOLS --------------------
-def fetch():
-    try:
-        r = requests.get(GECKO_URL, timeout=10)
-        return r.json().get("data", [])
-    except:
-        return []
+def fetch_pools():
+    r = requests.get(GECKO_URL, timeout=10)
+    return r.json().get("data", [])
 
-# -------------------- MONITOR --------------------
 async def monitor():
-    print("✅ Sol Gem Hunter running...")
+    print("✅ Solana Gem Hunter Bot Running...")
 
     while True:
-        pools = fetch()
+        print(f"[{datetime.now()}] ℹ️ Checking pools... seen={len(seen)}")
+
+        try:
+            pools = fetch_pools()
+        except Exception as e:
+            print(f"[{datetime.now()}] ⚠️ Gecko Error: {e}")
+            await asyncio.sleep(POLL_DELAY)
+            continue
 
         for p in pools:
-            attr = p.get("attributes", {})
-            token = attr.get("base_token_name")
-            symbol = attr.get("base_token_symbol")
+            attrs = p.get("attributes", {})
+            token = attrs.get("base_token_name")
+            symbol = attrs.get("base_token_symbol")
             pool_id = p.get("id")
 
-            # TX & Volume
-            tx = attr.get("txn_count") or 0
-            vol = attr.get("volume_usd") or 0
-            vol = float(vol) if isinstance(vol, (float, int, str)) else 0
+            tx = int(attrs.get("txn_count", 0) or 0)
+            vol = attrs.get("volume_usd", 0)
+            if isinstance(vol, dict):
+                vol = vol.get("h24", 0)
+            vol = float(vol or 0)
 
-            # First seen = store baseline
+            # First appearance
             if pool_id not in seen:
                 seen[pool_id] = tx
+                print(f"🆕 New token spotted: {symbol} | tx={tx} vol={vol}")
 
-                # 🆕 NEW COIN
-                if tx <= 1 and vol <= 5000:
-                    await send(
-                        f"🆕 **New SOL Token**\n"
-                        f"{symbol} ({token})\n"
-                        f"💵 Volume: ${vol}\n"
-                        f"🧾 TX: {tx}\n"
-                        f"https://www.geckoterminal.com/solana/pools/{pool_id}"
+                if tx >= 1 and vol >= 5000:
+                    print(f"📊 Matched gem criteria — sending alert: {symbol}")
+                    await send_msg(
+                        f"🆕 **NEW SOL GEM FOUND**\n\n"
+                        f"💎 Token: {symbol} ({token})\n"
+                        f"💰 Volume: ${round(vol,2)}\n"
+                        f"📈 Txns: {tx}\n"
+                        f"📊 Chart:\nhttps://www.geckoterminal.com/solana/pools/{pool_id}"
                     )
                 continue
 
-            prev = seen[pool_id]
-
-            # 📈 VOLUME SPIKE
-            if tx > prev and vol >= 5000:
-                await send(
-                    f"🚨 **Volume Spike**\n"
-                    f"{symbol} ({token})\n"
-                    f"TX: {tx} (+{tx-prev})\n"
-                    f"💵 Volume: ${vol}\n"
-                    f"https://www.geckoterminal.com/solana/pools/{pool_id}"
+            # spike detection
+            prev_tx = seen[pool_id]
+            if tx > prev_tx + 3:
+                print(f"🚀 Spike detected: {symbol} | tx {prev_tx} -> {tx}")
+                await send_msg(
+                    f"🚨 **SPIKE ALERT**\n\n"
+                    f"💎 Token: {symbol} ({token})\n"
+                    f"📈 Txns: {tx} (+{tx-prev_tx})\n"
+                    f"💰 Volume: ${round(vol,2)}\n"
+                    f"📊 Chart:\nhttps://www.geckoterminal.com/solana/pools/{pool_id}"
                 )
 
             seen[pool_id] = tx
 
-        await asyncio.sleep(POLL)
+        await asyncio.sleep(POLL_DELAY)
 
-# -------------------- WEB SERVER (Render keep-alive) --------------------
-async def home(request):
-    return web.Response(text="Bot alive ✅")
+async def main():
+    await monitor()
 
-async def run_all():
-    asyncio.create_task(monitor())
-    app = web.Application()
-    app.router.add_get("/", home)
-    return app
-
-if __name__ == "__main__":
-    web.run_app(run_all(), host="0.0.0.0", port=PORT)
+client.loop.run_until_complete(main())
