@@ -55,20 +55,20 @@ async def post_to_channel(token, pool_id):
     print(msg)
     if _bot:
         try:
-            # Use synchronous send_message to ensure it posts immediately
-            _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         except Exception as e:
             print(f"⚠️ Failed to send Telegram message: {e}")
 
 # -----------------------------
 # SEND STARTUP TEST MESSAGE
 # -----------------------------
-def send_startup_message():
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+async def send_startup_message():
+    if _bot and TELEGRAM_CHAT_ID:
         try:
-            bot = Bot(token=TELEGRAM_BOT_TOKEN)
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                             text="✅ Bot started successfully and is now monitoring GeckoTerminal!")
+            await _bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text="✅ Bot started successfully and is now monitoring GeckoTerminal!"
+            )
         except Exception as e:
             print(f"⚠️ Failed to send startup test message: {e}")
 
@@ -115,23 +115,11 @@ async def monitor_pools():
         for pool in pools:
             token = pool.get("attributes", {})
             pool_id = pool.get("id")
-            if not pool_id or pool_id in seen_pools:
+            if not pool_id or pool_id in seen_pools or pool_id in pending_pools:
                 continue
 
-            holders = token.get("holders") or token.get("holders_count") or 0
-            market_cap = token.get("market_cap_usd") or token.get("liquidity_usd") or 0
-            base_token_address = token.get("base_token_address")
-
-            should_post = bool(base_token_address) or (holders >= 1 and market_cap >= 5000)
-
-            if should_post:
-                if holders >= 1 and market_cap >= 5000:
-                    await post_to_channel(token, pool_id)
-                    seen_pools.add(pool_id)
-                else:
-                    pending_pools[pool_id] = token
-            else:
-                print(f"⚠️ Skipping pool: {token.get('symbol','Unknown')} | holders={holders} market_cap={market_cap}")
+            # Add all new pools to pending, even with 0 holders or 0 market cap
+            pending_pools[pool_id] = token
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -156,11 +144,14 @@ async def on_startup(app):
 
     _client_session = aiohttp.ClientSession()
 
-    # send startup test message
-    send_startup_message()
+    # Send startup test message
+    if _bot and TELEGRAM_CHAT_ID:
+        asyncio.create_task(send_startup_message())
 
+    # Start the monitor loop
     loop = asyncio.get_event_loop()
     _monitor_task = loop.create_task(monitor_pools())
+
     print("Startup complete. Background monitor task started.")
 
 async def on_cleanup(app):
