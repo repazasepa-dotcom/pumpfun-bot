@@ -39,7 +39,6 @@ async def post_to_channel(token, pool_id):
     holders = token.get("holders") or token.get("holders_count") or 0
     market_cap = token.get("market_cap_usd") or token.get("liquidity_usd") or 0
 
-    # Badge for pools with no base token
     no_base_badge = ""
     if not token.get("base_token_address"):
         no_base_badge = "⚠️ No base token\n"
@@ -56,22 +55,22 @@ async def post_to_channel(token, pool_id):
     print(msg)
     if _bot:
         try:
-            await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            # Use synchronous send_message to ensure it posts immediately
+            _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         except Exception as e:
             print(f"⚠️ Failed to send Telegram message: {e}")
 
 # -----------------------------
-# SEND TEST MESSAGE ON STARTUP
+# SEND STARTUP TEST MESSAGE
 # -----------------------------
-async def send_test_message():
-    if _bot and TELEGRAM_CHAT_ID:
+def send_startup_message():
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            await _bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text="✅ Bot started successfully and is now monitoring GeckoTerminal!"
-            )
+            bot = Bot(token=TELEGRAM_BOT_TOKEN)
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                             text="✅ Bot started successfully and is now monitoring GeckoTerminal!")
         except Exception as e:
-            print(f"⚠️ Failed to send test message: {e}")
+            print(f"⚠️ Failed to send startup test message: {e}")
 
 # -----------------------------
 # FETCH POOLS
@@ -130,7 +129,6 @@ async def monitor_pools():
                     await post_to_channel(token, pool_id)
                     seen_pools.add(pool_id)
                 else:
-                    # Not ready yet, store in pending for retry
                     pending_pools[pool_id] = token
             else:
                 print(f"⚠️ Skipping pool: {token.get('symbol','Unknown')} | holders={holders} market_cap={market_cap}")
@@ -157,10 +155,10 @@ async def on_startup(app):
         print("⚠️ BOT_TOKEN not supplied; Telegram messages disabled")
 
     _client_session = aiohttp.ClientSession()
-    
-    # Send startup test message
-    await send_test_message()
-    
+
+    # send startup test message
+    send_startup_message()
+
     loop = asyncio.get_event_loop()
     _monitor_task = loop.create_task(monitor_pools())
     print("Startup complete. Background monitor task started.")
