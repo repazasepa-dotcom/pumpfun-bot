@@ -15,7 +15,6 @@ GECKO_URL = os.getenv(
     "GECKO_POOLS_URL",
     "https://api.geckoterminal.com/api/v2/networks/solana/pools"
 )
-
 PORT = int(os.getenv("PORT", "8000"))
 HOST = "0.0.0.0"
 
@@ -80,8 +79,7 @@ async def fetch_pools():
                 data = await resp.json()
                 return data.get("data", [])
             return []
-    except Exception as e:
-        print(f"⚠️ Failed to fetch pools: {e}")
+    except:
         return []
 
 # -----------------------------
@@ -89,7 +87,6 @@ async def fetch_pools():
 # -----------------------------
 async def monitor_pools():
     global seen_pools, pending_pools
-    print("✅ Bot monitor started and watching GeckoTerminal")
     while True:
         pools = await fetch_pools()
 
@@ -127,7 +124,13 @@ async def monitor_pools():
 async def handle_health(request):
     return web.Response(text="OK")
 
-async def on_startup(app):
+async def handle_metrics(request):
+    return web.json_response({
+        "seen_pools_count": len(seen_pools),
+        "pending_pools_count": len(pending_pools)
+    })
+
+async def create_app():
     global _bot, _monitor_task, _client_session
     if TELEGRAM_BOT_TOKEN:
         _bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -137,33 +140,18 @@ async def on_startup(app):
     # Send startup test message
     asyncio.create_task(send_startup_message())
 
-    # Start monitor loop
+    # Start the monitor loop
     loop = asyncio.get_event_loop()
     _monitor_task = loop.create_task(monitor_pools())
 
-async def on_cleanup(app):
-    global _monitor_task, _client_session
-    if _monitor_task:
-        _monitor_task.cancel()
-        try:
-            await _monitor_task
-        except asyncio.CancelledError:
-            pass
-    if _client_session:
-        await _client_session.close()
-    print("Clean shutdown complete.")
-
-def create_app():
     app = web.Application()
     app.router.add_get("/", handle_health)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
+    app.router.add_get("/metrics", handle_metrics)
     return app
 
 # -----------------------------
 # MAIN ENTRY
 # -----------------------------
 if __name__ == "__main__":
-    app = create_app()
-    print(f"Starting webserver on {HOST}:{PORT}")
+    app = asyncio.run(create_app())
     web.run_app(app, host=HOST, port=PORT)
