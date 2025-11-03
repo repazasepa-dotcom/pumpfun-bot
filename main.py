@@ -5,9 +5,9 @@ from telethon import TelegramClient
 
 # -------------------- ENV --------------------
 API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH"))
-BOT_TOKEN = os.getenv("BOT_TOKEN"))
-CHANNEL = os.getenv("CHANNEL"))  # @channel or ID
+API_HASH = os.getenv("API_HASH")  # ✅ fixed
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL = os.getenv("CHANNEL")  # @channel or ID
 PORT = int(os.getenv("PORT", "10000"))
 
 GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
@@ -54,7 +54,7 @@ async def monitor():
             if pool_id not in seen:
                 seen[pool_id] = tx
 
-                # 🆕 NEW COIN FOUND
+                # 🆕 NEW COIN
                 if tx <= 1 and vol <= 5000:
                     await send(
                         f"🆕 **New SOL Token**\n"
@@ -67,7 +67,7 @@ async def monitor():
 
             prev = seen[pool_id]
 
-            # 📈 PUMP SIGNAL
+            # 📈 VOLUME SPIKE
             if tx > prev and vol >= 5000:
                 await send(
                     f"🚨 **Volume Spike**\n"
@@ -81,7 +81,7 @@ async def monitor():
 
         await asyncio.sleep(POLL)
 
-# -------------------- WEB (Render keep-alive) --------------------
+# -------------------- WEB SERVER (Render keep-alive) --------------------
 async def home(request):
     return web.Response(text="Bot alive ✅")
 
