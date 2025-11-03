@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, time, json, requests, threading, datetime, asyncio
+import os, time, json, requests, threading, asyncio, datetime
 from flask import Flask
 from telethon import TelegramClient
 
@@ -8,10 +8,12 @@ from telethon import TelegramClient
 # -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "YOUR_TELEGRAM_CHANNEL_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # use @username for test channel
 
 SOLANA_RPC = os.getenv("SOL_RPC", "https://api.mainnet-beta.solana.com")
+DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
+CHECK_INTERVAL = 10 if DEBUG_MODE else 120  # 10s for testing, 2min for production
 
 client = TelegramClient("session", API_ID, API_HASH)
 holder_history = {}  # {mint: {"first": int, "time": timestamp}}
@@ -123,25 +125,21 @@ async def analyze_token(pool):
         print("Analyze Error:", e)
 
 # -----------------------------
-# MAIN LOOP
+# MAIN MONITOR LOOP
 # -----------------------------
 async def monitor():
     await client.connect()
     if not await client.is_user_authorized():
         await client.start(bot_token=BOT_TOKEN)
 
-    # ✅ Send a startup message safely
-    try:
-        await send_telegram("✅ Bot started and monitoring GeckoTerminal ✅")
-    except Exception as e:
-        print("Startup message failed:", e)
+    await send_telegram("✅ Bot started and monitoring GeckoTerminal ✅")
 
     while True:
-        print(f"[{datetime.datetime.now().isoformat()}] Checking GeckoTerminal new pools...")
+        print(f"[{datetime.datetime.utcnow().isoformat()}] Checking GeckoTerminal new pools...")
         pools = get_new_pools()
         for p in pools:
             await analyze_token(p)
-        await asyncio.sleep(120)  # check every 2 minutes
+        await asyncio.sleep(CHECK_INTERVAL)
 
 # -----------------------------
 # FLASK KEEP ALIVE
