@@ -9,8 +9,8 @@ from telegram import Bot
 # CONFIG / ENV
 # -----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")  # "@channelusername" or numeric chat id
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 15))  # seconds between checks
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 15))
 GECKO_URL = os.getenv(
     "GECKO_POOLS_URL",
     "https://api.geckoterminal.com/api/v2/networks/solana/pools"
@@ -23,7 +23,8 @@ HOST = "0.0.0.0"
 # GLOBALS
 # -----------------------------
 seen_pools = set()
-pending_pools = dict()  # pool_id -> pool data for retry
+pending_pools = dict()   # pool_id -> token data
+pool_stats = dict()      # pool_id -> {"holders": int, "market_cap": float}
 _bot = None
 _client_session = None
 _monitor_task = None
@@ -44,7 +45,7 @@ async def post_to_channel(token, pool_id):
         no_base_badge = "⚠️ No base token\n"
 
     msg = (
-        f"📢 New pool detected!\n"
+        f"📢 New pool gaining momentum!\n"
         f"{no_base_badge}"
         f"Token: {symbol} | {name}\n"
         f"Base Token: {base_token}\n"
@@ -60,7 +61,7 @@ async def post_to_channel(token, pool_id):
             print(f"⚠️ Failed to send Telegram message: {e}")
 
 # -----------------------------
-# SEND STARTUP TEST MESSAGE
+# STARTUP TEST MESSAGE
 # -----------------------------
 async def send_startup_message():
     if _bot and TELEGRAM_CHAT_ID:
@@ -92,39 +93,48 @@ async def fetch_pools():
         return []
 
 # -----------------------------
-# MONITOR LOOP
+# MONITOR LOOP WITH MOMENTUM
 # -----------------------------
 async def monitor_pools():
-    global seen_pools, pending_pools
+    global seen_pools, pending_pools, pool_stats
     print("✅ Bot monitor started and watching GeckoTerminal")
     while True:
         print(f"⏱ Checking GeckoTerminal... Seen {len(seen_pools)} pools so far")
         pools = await fetch_pools()
 
-        # Retry pending pools first
+        # Retry pending pools and check momentum
         for pool_id in list(pending_pools.keys()):
             token = pending_pools[pool_id]
             holders = token.get("holders") or token.get("holders_count") or 0
             market_cap = token.get("market_cap_usd") or token.get("liquidity_usd") or 0
-            if holders >= 1 and market_cap >= 5000:
+
+            prev_stats = pool_stats.get(pool_id, {"holders": 0, "market_cap": 0})
+            holders_delta = holders - prev_stats["holders"]
+            market_cap_delta = market_cap - prev_stats["market_cap"]
+
+            # Update stats
+            pool_stats[pool_id] = {"holders": holders, "market_cap": market_cap}
+
+            # Check momentum thresholds
+            if (holders_delta >= 1 or (prev_stats["market_cap"] > 0 and market_cap_delta / prev_stats["market_cap"] >= 0.1)) \
+                and market_cap >= 5000 and holders >= 1:
                 await post_to_channel(token, pool_id)
                 seen_pools.add(pool_id)
                 del pending_pools[pool_id]
 
-        # Process new pools
+        # Add new pools to pending
         for pool in pools:
             token = pool.get("attributes", {})
             pool_id = pool.get("id")
             if not pool_id or pool_id in seen_pools or pool_id in pending_pools:
                 continue
-
-            # Add all new pools to pending, even with 0 holders or 0 market cap
             pending_pools[pool_id] = token
+            pool_stats[pool_id] = {"holders": 0, "market_cap": 0}
 
         await asyncio.sleep(POLL_INTERVAL)
 
 # -----------------------------
-# AIOHTTP WEB APP
+# WEB APP
 # -----------------------------
 async def handle_health(request):
     return web.Response(text="OK")
@@ -143,15 +153,9 @@ async def on_startup(app):
         print("⚠️ BOT_TOKEN not supplied; Telegram messages disabled")
 
     _client_session = aiohttp.ClientSession()
-
-    # Send startup test message
-    if _bot and TELEGRAM_CHAT_ID:
-        asyncio.create_task(send_startup_message())
-
-    # Start the monitor loop
+    asyncio.create_task(send_startup_message())
     loop = asyncio.get_event_loop()
     _monitor_task = loop.create_task(monitor_pools())
-
     print("Startup complete. Background monitor task started.")
 
 async def on_cleanup(app):
@@ -174,9 +178,6 @@ def create_app():
     app.on_cleanup.append(on_cleanup)
     return app
 
-# -----------------------------
-# MAIN ENTRY
-# -----------------------------
 if __name__ == "__main__":
     app = create_app()
     print(f"Starting webserver on {HOST}:{PORT}")
