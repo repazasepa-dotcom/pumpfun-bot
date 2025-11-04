@@ -1,4 +1,2 @@
-telethon
-flask
-aiohttp
-
+aiohttp==3.9.4
+python-telegram-bot==20.5
