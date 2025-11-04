@@ -2,143 +2,133 @@
 import os
 import asyncio
 import aiohttp
-from flask import Flask
-from telethon import TelegramClient
+from aiohttp import web
+from telegram import Bot
 
 # -----------------------------
-# ENV VARIABLES
+# CONFIG / ENV
 # -----------------------------
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL = os.getenv("CHANNEL")  # @channelusername or numeric ID
-PORT = int(os.getenv("PORT", "10000"))
-
-# GeckoTerminal API URL
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHANNEL")  # numeric ID or "@channelusername"
 GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
-
-# -----------------------------
-# TELEGRAM CLIENT
-# -----------------------------
-client = TelegramClient("sol_gem_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-
-# -----------------------------
-# KEEP-ALIVE WEB SERVER
-# -----------------------------
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "✅ Solana Gem Hunter Bot Running & Alive!"
-
-def keep_alive():
-    app.run(host="0.0.0.0", port=PORT)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 10))
+PORT = int(os.getenv("PORT", 10000))
+HOST = "0.0.0.0"
 
 # -----------------------------
 # GLOBALS
 # -----------------------------
-seen = {}  # pool_id -> {"txns": last_txns, "mcap": last_mcap}
-POLL_DELAY = 10  # seconds
+seen_pools = {}  # pool_id -> {"txns": int, "mcap": float}
+_bot = None
+_client_session = None
 
 # -----------------------------
-# SEND TELEGRAM ALERT
+# TELEGRAM POST FUNCTION
 # -----------------------------
-async def send_alert(text):
+async def post_to_channel(token, pool_id):
+    symbol = token.get("symbol", "Unknown")
+    name = token.get("name", "Unknown")
+    base_token = token.get("base_token_symbol", "Unknown")
+    txns = int(token.get("txn_count") or token.get("txns") or 0)
+    mcap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
+
+    msg = (
+        f"🆕 **SOL GEM ALERT!**\n\n"
+        f"Token: {symbol} | {name}\n"
+        f"Base Token: {base_token}\n"
+        f"Transactions: {txns}\n"
+        f"Market Cap: ${round(mcap,2)}\n"
+        f"Pool ID: {pool_id}\n"
+        f"Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
+    )
+
     try:
-        await client.send_message(CHANNEL, text, parse_mode="Markdown")
+        await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+        print(f"✅ Alert sent for {symbol} ({pool_id})")
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
+        print(f"⚠️ Telegram error: {e}")
 
 # -----------------------------
-# NEW POOL ALERT
+# FETCH POOLS
 # -----------------------------
-async def new_pool_alert(attrs):
-    name = attrs.get("base_token_name", "Unknown")
-    symbol = attrs.get("base_token_symbol", "Unknown")
-    pool_id = attrs.get("id")
-    txns = attrs.get("txn_count") or attrs.get("txns") or 0
-    mcap = attrs.get("market_cap_usd") or attrs.get("liquidity_usd") or 0
-
-    text = (
-        f"🆕 **NEW SOL GEM FOUND**\n\n"
-        f"💎 Token: {symbol} ({name})\n"
-        f"📈 Txns: {txns}\n"
-        f"💰 Market Cap: ${round(mcap,2)}\n"
-        f"📊 Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
-    )
-    await send_alert(text)
-    print(f"✅ New pool alert sent: {symbol}")
+async def fetch_pools():
+    global _client_session
+    if _client_session is None:
+        _client_session = aiohttp.ClientSession()
+    try:
+        async with _client_session.get(GECKO_URL, timeout=20) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("data", [])
+            print(f"⚠️ GeckoTerminal API returned status {resp.status}")
+            return []
+    except Exception as e:
+        print(f"⚠️ Error fetching pools: {e}")
+        return []
 
 # -----------------------------
-# PUMP ALERT
-# -----------------------------
-async def pump_alert(attrs, prev_txns, prev_mcap):
-    name = attrs.get("base_token_name", "Unknown")
-    symbol = attrs.get("base_token_symbol", "Unknown")
-    pool_id = attrs.get("id")
-    txns = attrs.get("txn_count") or attrs.get("txns") or 0
-    mcap = attrs.get("market_cap_usd") or attrs.get("liquidity_usd") or 0
-
-    text = (
-        f"🚨 **PUMP ALERT**\n\n"
-        f"💎 Token: {symbol} ({name})\n"
-        f"📈 Txns: {txns} (+{txns - prev_txns})\n"
-        f"💰 Market Cap: ${round(mcap,2)} (+${round(mcap - prev_mcap,2)})\n"
-        f"📊 Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
-    )
-    await send_alert(text)
-    print(f"🚀 Pump alert sent: {symbol}")
-
-# -----------------------------
-# MONITOR POOLS
+# MONITOR LOOP
 # -----------------------------
 async def monitor_pools():
-    async with aiohttp.ClientSession() as session:
-        print("🚀 Bot started — monitoring Solana pools")
-        while True:
-            try:
-                async with session.get(GECKO_URL, timeout=15) as resp:
-                    data = await resp.json()
-                    pools = data.get("data", [])
-            except Exception as e:
-                print(f"⚠️ Error fetching GeckoTerminal: {e}")
-                await asyncio.sleep(POLL_DELAY)
+    global seen_pools
+    print("🚀 Monitoring Solana pools...")
+
+    while True:
+        pools = await fetch_pools()
+
+        for pool in pools:
+            token = pool.get("attributes", {})
+            pool_id = pool.get("id")
+            if not pool_id:
                 continue
 
-            for pool in pools:
-                attrs = pool.get("attributes", {})
-                pool_id = pool.get("id")
-                if not pool_id:
-                    continue
+            try:
+                txns = int(token.get("txn_count") or token.get("txns") or 0)
+                mcap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
+            except (ValueError, TypeError):
+                continue
 
-                txns = attrs.get("txn_count") or attrs.get("txns") or 0
-                mcap = attrs.get("market_cap_usd") or attrs.get("liquidity_usd") or 0
+            prev = seen_pools.get(pool_id)
+            if not prev:
+                seen_pools[pool_id] = {"txns": txns, "mcap": mcap}
+                if txns >= 1 and mcap >= 5000:
+                    await post_to_channel(token, pool_id)
+                continue
 
-                if pool_id not in seen:
-                    if txns >= 1 and mcap >= 5000:
-                        await new_pool_alert(attrs)
-                    seen[pool_id] = {"txns": txns, "mcap": mcap}
-                    continue
+            prev_txns = int(prev["txns"])
+            prev_mcap = float(prev["mcap"])
 
-                # check for pump
-                prev = seen[pool_id]
-                if (txns - prev["txns"] >= 3) or (mcap - prev["mcap"] >= 5000):
-                    await pump_alert(attrs, prev["txns"], prev["mcap"])
+            if (txns - prev_txns >= 3) or (mcap - prev_mcap >= 5000):
+                await post_to_channel(token, pool_id)
 
-                # update last seen
-                seen[pool_id] = {"txns": txns, "mcap": mcap}
+            seen_pools[pool_id] = {"txns": txns, "mcap": mcap}
 
-            await asyncio.sleep(POLL_DELAY)
+        await asyncio.sleep(POLL_INTERVAL)
 
 # -----------------------------
-# MAIN ENTRY
+# AIOHTTP KEEP-ALIVE
 # -----------------------------
-def run_bot():
-    loop = asyncio.get_event_loop()
-    loop.create_task(monitor_pools())
-    client.run_until_disconnected()
+async def handle_health(request):
+    return web.Response(text="OK")
 
+async def start_app():
+    global _bot
+    if TELEGRAM_BOT_TOKEN:
+        _bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        # Startup message
+        try:
+            await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ Bot started & monitoring GeckoTerminal!")
+        except Exception as e:
+            print(f"⚠️ Failed startup message: {e}")
+
+    asyncio.create_task(monitor_pools())
+
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    return app
+
+# -----------------------------
+# MAIN
+# -----------------------------
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=keep_alive).start()
-    run_bot()
+    web.run_app(start_app(), host=HOST, port=PORT)
