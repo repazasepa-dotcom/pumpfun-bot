@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
 import os
 import asyncio
-import threading
-import time
-from datetime import datetime
 import requests
-from bs4 import BeautifulSoup
+from datetime import datetime
 from flask import Flask
-from telethon import TelegramClient, Button, events
+from telethon import TelegramClient
 
 # -----------------------------
 # ENVIRONMENT VARIABLES
 # -----------------------------
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL = os.getenv("CHANNEL", "")  # @channelusername or numeric ID
-PORT = int(os.getenv("PORT", "10000"))
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL = os.getenv("CHANNEL")  # e.g., @yourchannelusername
+PORT = int(os.getenv("PORT", 10000))
 
 # -----------------------------
-# GLOBALS
-# -----------------------------
-seen = {}  # coin_id -> {"txns": last_txn, "mcap": last_mcap}
-POLL_DELAY = 10  # seconds
-PUMP_FUN_URL = "https://pump.fun/?view=table&coins_sort=created_timestamp"
-TXN_SPIKE = 3
-MCAP_SPIKE = 10000  # $10k spike threshold
-MCAP_GROWTH_PERCENT = 50  # minimum % growth to alert
-TXN_GROWTH_MULTIPLIER = 2  # minimum TXN growth factor to alert
-
-# -----------------------------
-# FLASK KEEP-ALIVE
+# FLASK KEEP-ALIVE SERVER
 # -----------------------------
 app = Flask(__name__)
 
@@ -43,135 +29,97 @@ def keep_alive():
     app.run(host="0.0.0.0", port=PORT)
 
 # -----------------------------
-# TELEGRAM CLIENT
+# TELEGRAM BOT
 # -----------------------------
 client = TelegramClient("pumpfun_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-async def send_alert(token_name, symbol, txns, mcap, coin_link, alert_type="NEW GEM", growth_txn=None, growth_mcap=None):
-    growth_text = ""
-    if growth_txn is not None:
-        growth_text += f"\n📈 TXN Growth: {growth_txn:+}"
-    if growth_mcap is not None:
-        growth_text += f"\n💰 MCAP Growth: +${growth_mcap:.2f}"
+# Track seen pools to detect new or updated activity
+seen = {}
 
+GECKO_URL = "https://www.geckoterminal.com/api/v2/networks/solana/pools?include=base_token"
+POLL_DELAY = 10  # seconds between polls
+
+# -----------------------------
+# SEND ALERT
+# -----------------------------
+async def send_alert(symbol, name, txns, mcap, pool_id):
     text = (
-        f"🚨 **{alert_type}!**\n\n"
-        f"💎 Token: {symbol} ({token_name})\n"
-        f"📈 Transactions: {txns}\n"
-        f"💰 Market Cap: ${mcap}{growth_text}\n"
-        f"🔗 [View on Pump.Fun]({coin_link})"
+        f"🚨 **ALERT: Potential Gem Detected!**\n\n"
+        f"💎 Token: {symbol} ({name})\n"
+        f"📈 Txns: {txns}\n"
+        f"💰 MCAP: ${mcap}\n"
+        f"📊 Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
     )
     try:
-        await client.send_message(CHANNEL, text, parse_mode="Markdown")
-        print(f"[{datetime.now()}] ✅ Alert sent for {symbol} ({alert_type})")
+        await client.send_message(CHANNEL, text)
+        print(f"✅ Alert sent for {symbol} ({pool_id})")
     except Exception as e:
-        print(f"[{datetime.now()}] ⚠️ Telegram Error: {e}")
+        print(f"⚠️ Telegram error: {e}")
 
 # -----------------------------
-# SCRAPE PUMP.FUN
+# TEST ALERT (verifies channel works)
 # -----------------------------
-def fetch_coins():
-    try:
-        r = requests.get(PUMP_FUN_URL, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        table = soup.find("table")
-        coins = []
-        if table:
-            rows = table.find_all("tr")[1:]  # skip header
-            for row in rows:
-                cols = row.find_all("td")
-                if len(cols) < 5:
-                    continue
-                coin_name = cols[1].text.strip()
-                symbol = cols[2].text.strip()
-                txns = int(cols[3].text.strip() or 0)
-                mcap_text = cols[4].text.strip().replace("$","").replace(",","")
-                try:
-                    mcap = float(mcap_text)
-                except:
-                    mcap = 0
-                coin_id = f"{coin_name}_{symbol}"
-                coins.append({
-                    "id": coin_id,
-                    "name": coin_name,
-                    "symbol": symbol,
-                    "txns": txns,
-                    "mcap": mcap
-                })
-        return coins
-    except Exception as e:
-        print(f"[{datetime.now()}] ⚠️ Error fetching Pump.Fun: {e}")
-        return []
+async def test_alert():
+    await send_alert("TestCoin", "TEST", 1, 5000, "test_pool")
+    print("✅ Test alert sent!")
 
 # -----------------------------
-# MONITOR LOOP
+# MONITOR COINS
 # -----------------------------
-async def monitor_loop():
-    print(f"[{datetime.now()}] 🔍 PumpFun Bot Started")
+async def monitor():
+    print("🚀 Solana Gem Hunter Bot Running...")
     while True:
-        coins = fetch_coins()
-        for c in coins:
-            coin_id = c["id"]
-            txns = c["txns"]
-            mcap = c["mcap"]
-            coin_link = f"https://pump.fun/?coin={coin_id}"
+        print(f"[{datetime.now()}] 🔍 Checking pools... seen={len(seen)}")
+        try:
+            r = requests.get(GECKO_URL, timeout=10)
+            pools = r.json().get("data", [])
+        except Exception as e:
+            print(f"[{datetime.now()}] ⚠️ Gecko fetch error: {e}")
+            await asyncio.sleep(POLL_DELAY)
+            continue
 
-            if coin_id not in seen:
-                # First time seeing the coin
-                seen[coin_id] = {"txns": txns, "mcap": mcap}
+        for pool in pools:
+            attrs = pool.get("attributes", {})
+            token_name = attrs.get("base_token_name", "Unknown")
+            token_symbol = attrs.get("base_token_symbol", "Unknown")
+            pool_id = pool.get("id", "Unknown")
+
+            txns = int(attrs.get("txn_count", 0) or 0)
+            mcap = attrs.get("market_cap_usd", 0) or 0
+            try:
+                mcap = float(mcap)
+            except:
+                mcap = 0
+
+            # first appearance
+            if pool_id not in seen:
+                seen[pool_id] = txns
                 if txns >= 1 and mcap >= 5000:
-                    await send_alert(c["name"], c["symbol"], txns, mcap, coin_link, "NEW GEM")
-            else:
-                prev = seen[coin_id]
-                txn_delta = txns - prev["txns"]
-                mcap_delta = mcap - prev["mcap"]
+                    await send_alert(token_symbol, token_name, txns, mcap, pool_id)
+                continue
 
-                txn_growth = txn_delta
-                mcap_growth_percent = (mcap_delta / prev["mcap"] * 100) if prev["mcap"] > 0 else 0
+            # spike detection
+            prev_tx = seen[pool_id]
+            if txns > prev_tx + 3:
+                await send_alert(token_symbol, token_name, txns, mcap, pool_id)
 
-                # Spike or growth alert
-                if txn_delta >= TXN_SPIKE or mcap_delta >= MCAP_SPIKE or txn_growth >= TXN_GROWTH_MULTIPLIER or mcap_growth_percent >= MCAP_GROWTH_PERCENT:
-                    await send_alert(
-                        c["name"], c["symbol"], txns, mcap, coin_link,
-                        alert_type="POTENTIAL PUMP",
-                        growth_txn=txn_delta,
-                        growth_mcap=mcap_delta
-                    )
-                    seen[coin_id] = {"txns": txns, "mcap": mcap}
+            seen[pool_id] = txns
 
-        print(f"[{datetime.now()}] ℹ️ Checked pools, total seen={len(seen)}")
         await asyncio.sleep(POLL_DELAY)
 
 # -----------------------------
-# TELEGRAM /start COMMAND
+# MAIN
 # -----------------------------
-@client.on(events.NewMessage(pattern="/start"))
-async def start(event):
-    user = event.sender_id
-    print(f"[{datetime.now()}] /start used by {user}")
-    await event.reply(
-        "🤖 PumpFun Bot is running!\n"
-        "🔍 Monitoring new coins & spikes for potential pumps.\n"
-        "✅ Bot online.",
-        buttons=[
-            [Button.url("Join Channel", "https://t.me/pumpfun")],
-            [Button.url("Pump.Fun", "https://pump.fun/")]
-        ]
-    )
-
-# -----------------------------
-# RUN BOT & KEEP-ALIVE
-# -----------------------------
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(monitor_loop())
-    print(f"[{datetime.now()}] 🤖 Telegram bot starting...")
-    client.run_until_disconnected()
+async def main():
+    # Send a test alert at startup
+    await test_alert()
+    # Start monitoring coins
+    await monitor()
 
 if __name__ == "__main__":
+    # Start keep-alive server in separate thread
+    import threading
     threading.Thread(target=keep_alive).start()
-    time.sleep(1)
-    print(f"[{datetime.now()}] 🚀 Starting async bot loop now...")
-    run_bot()
+
+    # Run bot loop
+    client.loop.run_until_complete(main())
