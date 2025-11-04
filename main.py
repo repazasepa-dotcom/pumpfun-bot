@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-import os
 import asyncio
-import requests
+import json
+import os
+import random
+import threading
+import time
 from datetime import datetime
 from flask import Flask
-from telethon import TelegramClient
+from telethon import TelegramClient, events, Button
 
 # -----------------------------
 # ENVIRONMENT VARIABLES
 # -----------------------------
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL = os.getenv("CHANNEL")  # e.g., @yourchannelusername
-PORT = int(os.getenv("PORT", 10000))
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHANNEL = os.getenv("CHANNEL", "")  # your channel ID or @username
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # -----------------------------
-# FLASK KEEP-ALIVE SERVER
+# KEEP-ALIVE WEB SERVER (Render)
 # -----------------------------
 app = Flask(__name__)
 
@@ -25,101 +28,105 @@ def home():
     return "✅ PumpFun Bot Running & Alive!"
 
 def keep_alive():
-    print(f"🌍 Keep-alive running on port {PORT}")
-    app.run(host="0.0.0.0", port=PORT)
+    port = int(os.getenv("PORT", 10000))
+    print(f"🌍 Keep-alive running on port {port}")
+    app.run(host="0.0.0.0", port=port)
 
 # -----------------------------
-# TELEGRAM BOT
+# TELEGRAM BOT CLIENT
 # -----------------------------
 client = TelegramClient("pumpfun_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Track seen pools to detect new or updated activity
-seen = {}
-
-GECKO_URL = "https://www.geckoterminal.com/api/v2/networks/solana/pools?include=base_token"
-POLL_DELAY = 10  # seconds between polls
-
 # -----------------------------
-# SEND ALERT
+# BOT LOGIC
 # -----------------------------
-async def send_alert(symbol, name, txns, mcap, pool_id):
-    text = (
-        f"🚨 **ALERT: Potential Gem Detected!**\n\n"
-        f"💎 Token: {symbol} ({name})\n"
-        f"📈 Txns: {txns}\n"
-        f"💰 MCAP: ${mcap}\n"
-        f"📊 Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
-    )
+seen = set()  # Track already notified tokens
+
+async def send_msg(text):
     try:
         await client.send_message(CHANNEL, text)
-        print(f"✅ Alert sent for {symbol} ({pool_id})")
+        print(f"✅ Alert sent: {text.splitlines()[0]}")
     except Exception as e:
-        print(f"⚠️ Telegram error: {e}")
+        print(f"⚠️ Telegram Error: {e}")
 
-# -----------------------------
-# TEST ALERT (verifies channel works)
-# -----------------------------
-async def test_alert():
-    await send_alert("TestCoin", "TEST", 1, 5000, "test_pool")
-    print("✅ Test alert sent!")
-
-# -----------------------------
-# MONITOR COINS
-# -----------------------------
-async def monitor():
-    print("🚀 Solana Gem Hunter Bot Running...")
+async def analyze_pools():
     while True:
         print(f"[{datetime.now()}] 🔍 Checking pools... seen={len(seen)}")
-        try:
-            r = requests.get(GECKO_URL, timeout=10)
-            pools = r.json().get("data", [])
-        except Exception as e:
-            print(f"[{datetime.now()}] ⚠️ Gecko fetch error: {e}")
-            await asyncio.sleep(POLL_DELAY)
-            continue
 
-        for pool in pools:
-            attrs = pool.get("attributes", {})
-            token_name = attrs.get("base_token_name", "Unknown")
-            token_symbol = attrs.get("base_token_symbol", "Unknown")
-            pool_id = pool.get("id", "Unknown")
+        # Replace this with actual pool fetching from API or webpage
+        dummy_token = {
+            "name": f"Token{random.randint(1,999)}",
+            "mint": f"Mint_{random.randint(1000,9999)}",
+            "tx_count": random.randint(0, 15),
+            "mcap": random.randint(1000, 20000)  # Use MCAP instead of volume
+        }
 
-            txns = int(attrs.get("txn_count", 0) or 0)
-            mcap = attrs.get("market_cap_usd", 0) or 0
-            try:
-                mcap = float(mcap)
-            except:
-                mcap = 0
+        pool_id = dummy_token["mint"]
+        tx = dummy_token["tx_count"]
+        mcap = dummy_token["mcap"]
 
-            # first appearance
-            if pool_id not in seen:
-                seen[pool_id] = txns
-                if txns >= 1 and mcap >= 5000:
-                    await send_alert(token_symbol, token_name, txns, mcap, pool_id)
-                continue
+        print(f"[DEBUG] Checking pool {dummy_token['name']} | tx={tx} | mcap={mcap}")
 
-            # spike detection
-            prev_tx = seen[pool_id]
-            if txns > prev_tx + 3:
-                await send_alert(token_symbol, token_name, txns, mcap, pool_id)
+        # First sight
+        if pool_id not in seen:
+            seen.add(pool_id)
+            print(f"[+] 🆕 Token spotted: {dummy_token['name']} | tx={tx} | mcap={mcap}")
 
-            seen[pool_id] = txns
+            # Criteria: tx >= 1 and mcap >= 5000
+            if tx >= 1 and mcap >= 5000:
+                print(f"[ALERT] Matched criteria — sending alert: {dummy_token['name']}")
+                await send_msg(
+                    f"🆕 **NEW SOL GEM FOUND**\n\n"
+                    f"💎 Token: {dummy_token['name']}\n"
+                    f"📈 Txns: {tx}\n"
+                    f"💰 Market Cap: ${mcap}\n"
+                    f"📊 Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
+                )
 
-        await asyncio.sleep(POLL_DELAY)
+        # Example spike detection
+        prev_tx = seen.count(pool_id) if pool_id in seen else 0
+        if tx > prev_tx + 3:
+            print(f"🚀 Spike detected: {dummy_token['name']} | tx {prev_tx} -> {tx}")
+            await send_msg(
+                f"🚨 **SPIKE ALERT**\n\n"
+                f"💎 Token: {dummy_token['name']}\n"
+                f"📈 Txns: {tx} (+{tx-prev_tx})\n"
+                f"💰 Market Cap: ${mcap}\n"
+                f"📊 Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
+            )
+
+        await asyncio.sleep(10)  # polling delay
+
+# -----------------------------
+# TELEGRAM COMMANDS
+# -----------------------------
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    user = event.sender_id
+    print(f"[LOG] /start used by {user}")
+    await event.reply(
+        "🤖 **PumpFun Solana Bot** is running.\n\n"
+        "🔍 Auto-scanning pools\n"
+        "📈 Alerts on new tokens\n\n"
+        "✅ Bot online",
+        buttons=[
+            [Button.url("Join Channel", "https://t.me/pumpfun")],
+            [Button.url("DexScreener", "https://dexscreener.com/")]
+        ]
+    )
 
 # -----------------------------
 # MAIN
 # -----------------------------
-async def main():
-    # Send a test alert at startup
-    await test_alert()
-    # Start monitoring coins
-    await monitor()
+def run_bot():
+    print("✅ Telegram bot connected")
+    print("🚀 Starting Solana pool scan...")
+    loop = asyncio.get_event_loop()
+    loop.create_task(analyze_pools())
+    client.run_until_disconnected()
 
 if __name__ == "__main__":
-    # Start keep-alive server in separate thread
-    import threading
     threading.Thread(target=keep_alive).start()
-
-    # Run bot loop
-    client.loop.run_until_complete(main())
+    time.sleep(1)  # allow web server to boot
+    print("🚀 Starting async bot loop now...")
+    run_bot()
