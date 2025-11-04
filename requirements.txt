@@ -1,4 +1,4 @@
 telethon
 flask
-requests
+aiohttp
 
