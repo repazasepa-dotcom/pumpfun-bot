@@ -18,14 +18,14 @@ HOST = "0.0.0.0"
 # -----------------------------
 # GLOBALS
 # -----------------------------
-seen_pools = {}  # pool_id -> {"txns": int, "mcap": float}
+seen_pools = {}  # pool_id -> {"txns": int, "mcap": float, "liquidity": float}
 _bot = None
 _client_session = None
 
 # -----------------------------
 # TELEGRAM POST FUNCTION
 # -----------------------------
-async def post_to_channel(token, pool_id):
+async def post_to_channel(token, pool_id, reason="Potential Pump"):
     symbol = token.get("symbol", "Unknown")
     name = token.get("name", "Unknown")
     base_token = token.get("base_token_symbol", "Unknown")
@@ -33,12 +33,13 @@ async def post_to_channel(token, pool_id):
     mcap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
 
     msg = (
-        f"🆕 **SOL GEM ALERT!**\n\n"
+        f"🚨 **MEME COIN ALERT!** 🚨\n\n"
         f"Token: {symbol} | {name}\n"
         f"Base Token: {base_token}\n"
         f"Transactions: {txns}\n"
         f"Market Cap: ${round(mcap,2)}\n"
         f"Pool ID: {pool_id}\n"
+        f"Reason: {reason}\n"
         f"Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
     )
 
@@ -67,11 +68,11 @@ async def fetch_pools():
         return []
 
 # -----------------------------
-# MONITOR LOOP
+# MONITOR LOOP (MEME PUMP DETECTION)
 # -----------------------------
 async def monitor_pools():
     global seen_pools
-    print("🚀 Monitoring Solana pools...")
+    print("🚀 Monitoring Solana pools for potential meme coin pumps...")
 
     while True:
         pools = await fetch_pools()
@@ -85,23 +86,34 @@ async def monitor_pools():
             try:
                 txns = int(token.get("txn_count") or token.get("txns") or 0)
                 mcap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
+                liquidity = float(token.get("liquidity_usd") or 0)
             except (ValueError, TypeError):
                 continue
 
             prev = seen_pools.get(pool_id)
             if not prev:
-                seen_pools[pool_id] = {"txns": txns, "mcap": mcap}
-                if txns >= 1 and mcap >= 5000:
-                    await post_to_channel(token, pool_id)
+                seen_pools[pool_id] = {"txns": txns, "mcap": mcap, "liquidity": liquidity}
                 continue
 
             prev_txns = int(prev["txns"])
             prev_mcap = float(prev["mcap"])
+            prev_liquidity = float(prev["liquidity"])
 
-            if (txns - prev_txns >= 3) or (mcap - prev_mcap >= 5000):
-                await post_to_channel(token, pool_id)
+            reason = None
 
-            seen_pools[pool_id] = {"txns": txns, "mcap": mcap}
+            # MEME PUMP DETECTION LOGIC
+            if (txns - prev_txns >= 5) and (mcap - prev_mcap >= 5000):
+                reason = "High txn spike + Market Cap surge"
+            elif (liquidity - prev_liquidity >= 10000):
+                reason = "Liquidity surge detected"
+            elif (txns >= 10 and mcap < 20000):
+                reason = "Low cap high txn activity (classic meme pump)"
+
+            if reason:
+                await post_to_channel(token, pool_id, reason)
+
+            # update seen_pools
+            seen_pools[pool_id] = {"txns": txns, "mcap": mcap, "liquidity": liquidity}
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -117,7 +129,7 @@ async def start_app():
         _bot = Bot(token=TELEGRAM_BOT_TOKEN)
         # Startup message
         try:
-            await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ Bot started & monitoring GeckoTerminal!")
+            await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ Meme Pump Bot started & monitoring GeckoTerminal!")
         except Exception as e:
             print(f"⚠️ Failed startup message: {e}")
 
