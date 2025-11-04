@@ -1,346 +1,177 @@
 #!/usr/bin/env python3
-# PumpFun scout -> scrapes pump.fun table, scores coins, posts likely pumps to Telegram
-# Requirements: telethon, flask, requests, beautifulsoup4
-# Add to Render env: API_ID, API_HASH, BOT_TOKEN, CHANNEL, POLL_DELAY (optional), SCORE_THRESHOLD (optional)
-
 import os
-import time
-import threading
 import asyncio
-import re
-from datetime import datetime, timezone
-from typing import Optional
+import threading
+import time
+from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
-from telethon import TelegramClient
 from flask import Flask
+from telethon import TelegramClient, Button, events
 
-# ---------------------------
-# Config (environment)
-# ---------------------------
+# -----------------------------
+# ENVIRONMENT VARIABLES
+# -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL = os.getenv("CHANNEL", "")  # e.g. @mychannel or -100123456...
-POLL_DELAY = float(os.getenv("POLL_DELAY", "30"))  # seconds
-PUMPFUN_URL = os.getenv("PUMPFUN_URL", "https://pump.fun/?view=table&coins_sort=created_timestamp")
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "65"))  # 0-100
-MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "60"))  # minutes considered "recent"
-USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; PumpFunScout/1.0)")
+CHANNEL = os.getenv("CHANNEL", "")  # @channelusername or numeric ID
+PORT = int(os.getenv("PORT", "10000"))
 
-# scoring weights (tweakable via env if desired)
-W_RECENCY = float(os.getenv("W_RECENCY", "30"))
-W_TXNS    = float(os.getenv("W_TXNS", "25"))
-W_VOLUME  = float(os.getenv("W_VOLUME", "25"))
-W_LIQUID  = float(os.getenv("W_LIQUID", "10"))   # lower liquidity increases score
-W_HOLDERS = float(os.getenv("W_HOLDERS", "10"))  # lower holders increases score
+# -----------------------------
+# GLOBALS
+# -----------------------------
+seen = {}  # coin_id -> {"txns": last_txn, "mcap": last_mcap}
+POLL_DELAY = 10  # seconds
+PUMP_FUN_URL = "https://pump.fun/?view=table&coins_sort=created_timestamp"
+TXN_SPIKE = 3
+MCAP_SPIKE = 10000  # $10k spike threshold
+MCAP_GROWTH_PERCENT = 50  # minimum % growth to alert
+TXN_GROWTH_MULTIPLIER = 2  # minimum TXN growth factor to alert
 
-# ---------------------------
-# Init services
-# ---------------------------
-client = TelegramClient("pumpfun_bot", API_ID, API_HASH)
-app = Flask("pumpfun_keepalive")
+# -----------------------------
+# FLASK KEEP-ALIVE
+# -----------------------------
+app = Flask(__name__)
 
-# simple in-memory state to avoid duplicate posts
-posted = set()   # set of pool identifiers we've already posted
-seen_time = {}   # pool_id -> last seen timestamp
+@app.route("/")
+def home():
+    return "✅ PumpFun Bot Running & Alive!"
 
-# ---------------------------
-# Utility parsing helpers
-# ---------------------------
-def safe_float(x, default=0.0):
-    try:
-        if x is None:
-            return default
-        if isinstance(x, (int, float)):
-            return float(x)
-        # remove commas, $ etc
-        s = str(x).strip()
-        s = re.sub(r"[^\d.\-]", "", s)
-        if s == "" or s == "-" or s == ".":
-            return default
-        return float(s)
-    except Exception:
-        return default
+def keep_alive():
+    print(f"🌍 Keep-alive running on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT)
 
-def safe_int(x, default=0):
-    try:
-        return int(float(safe_float(x, default)))
-    except Exception:
-        return default
+# -----------------------------
+# TELEGRAM CLIENT
+# -----------------------------
+client = TelegramClient("pumpfun_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-def parse_iso_or_timestamp(txt: str) -> Optional[float]:
-    """
-    Try to parse a created timestamp shown in the table.
-    Returns epoch seconds or None.
-    Handles ISO or relative times like '2m', '1h', 'just now' or explicit datetime strings.
-    """
-    if not txt:
-        return None
-    s = txt.strip().lower()
-    now = datetime.now(timezone.utc)
-    # common relative patterns: 'just now', '2m', '10s', '1h'
-    if "just" in s or "now" in s:
-        return now.timestamp()
-    m = re.match(r"(\d+)\s*s", s)
-    if m:
-        return (now.timestamp() - int(m.group(1)))
-    m = re.match(r"(\d+)\s*m", s)
-    if m:
-        return (now.timestamp() - int(m.group(1)) * 60)
-    m = re.match(r"(\d+)\s*h", s)
-    if m:
-        return (now.timestamp() - int(m.group(1)) * 3600)
-    # try numeric unix timestamp
-    m = re.match(r"^\d{10,}$", s)
-    if m:
-        try:
-            return float(s)
-        except: 
-            return None
-    # try common datetime formats
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M", "%b %d, %Y %H:%M"):
-        try:
-            dt = datetime.strptime(txt, fmt)
-            return dt.replace(tzinfo=timezone.utc).timestamp()
-        except Exception:
-            pass
-    return None
+async def send_alert(token_name, symbol, txns, mcap, coin_link, alert_type="NEW GEM", growth_txn=None, growth_mcap=None):
+    growth_text = ""
+    if growth_txn is not None:
+        growth_text += f"\n📈 TXN Growth: {growth_txn:+}"
+    if growth_mcap is not None:
+        growth_text += f"\n💰 MCAP Growth: +${growth_mcap:.2f}"
 
-# ---------------------------
-# Scoring function
-# ---------------------------
-def score_coin(age_minutes, txns, volume_usd, liquidity_usd, holders):
-    """
-    Score 0-100 where higher means more likely to pump (heuristic).
-    age_minutes: coin age in minutes (lower -> higher recency score)
-    txns: number of transactions
-    volume_usd: 24h volume
-    liquidity_usd: pool liquidity (higher liquidity reduces risk)
-    holders: number of holders (higher holders reduces risk)
-    """
-    # recency score: coins younger than MAX_AGE_MIN get higher score
-    recency = max(0.0, (MAX_AGE_MIN - age_minutes) / MAX_AGE_MIN) * 100  # 0..100
-    recency = max(0.0, min(100.0, recency))
-
-    # txns score: saturate at, say, 50 txns
-    tx_score = min(100.0, (txns / 50.0) * 100.0)
-
-    # volume score: saturate at $100k
-    vol_score = min(100.0, (volume_usd / 100000.0) * 100.0)
-
-    # liquidity impact: low liquidity -> bonus (we invert liquidity)
-    liq_norm = min(1.0, liquidity_usd / 10000.0)  # 0..1
-    liq_score = (1.0 - liq_norm) * 100.0
-
-    # holders impact: fewer holders -> bonus
-    holders_norm = min(1.0, holders / 200.0)
-    holders_score = (1.0 - holders_norm) * 100.0
-
-    # weighted sum
-    weighted = (
-        W_RECENCY * recency +
-        W_TXNS * tx_score +
-        W_VOLUME * vol_score +
-        W_LIQUID * liq_score +
-        W_HOLDERS * holders_score
+    text = (
+        f"🚨 **{alert_type}!**\n\n"
+        f"💎 Token: {symbol} ({token_name})\n"
+        f"📈 Transactions: {txns}\n"
+        f"💰 Market Cap: ${mcap}{growth_text}\n"
+        f"🔗 [View on Pump.Fun]({coin_link})"
     )
-    # normalize by sum of weights
-    total_weights = W_RECENCY + W_TXNS + W_VOLUME + W_LIQUID + W_HOLDERS
-    if total_weights <= 0:
-        return 0.0
-    return (weighted / total_weights)
-
-# ---------------------------
-# Scrape Pump.Fun table
-# ---------------------------
-def scrape_pumpfun_table():
-    """
-    Fetch the page and parse table rows into dicts.
-    We try to be flexible about table structure.
-    Returns list of dict: [{id, name, symbol, created, txns, volume, liquidity, holders}, ...]
-    """
-    headers = {"User-Agent": USER_AGENT}
     try:
-        r = requests.get(PUMPFUN_URL, headers=headers, timeout=12)
-        r.raise_for_status()
-        html = r.text
-        soup = BeautifulSoup(html, "html.parser")
-
-        # find first table (flexible)
-        table = soup.find("table")
-        rows = []
-        if not table:
-            # fallback: find rows of items (cards)
-            items = soup.select(".coin-row, .table-row, .pool-row")
-            for it in items:
-                try:
-                    name = it.select_one(".name, .coin-name")
-                    symbol = it.select_one(".symbol")
-                    created = it.select_one(".created, .age")
-                    txns = it.select_one(".txns, .txn-count, .tx-count")
-                    volume = it.select_one(".volume, .vol")
-                    liq = it.select_one(".liquidity, .liq")
-                    holders = it.select_one(".holders")
-                    rows.append({
-                        "id": it.get("data-id") or it.get("id") or None,
-                        "name": (name.text.strip() if name else None),
-                        "symbol": (symbol.text.strip() if symbol else None),
-                        "created": (created.text.strip() if created else None),
-                        "txns": (txns.text.strip() if txns else None),
-                        "volume": (volume.text.strip() if volume else None),
-                        "liquidity": (liq.text.strip() if liq else None),
-                        "holders": (holders.text.strip() if holders else None)
-                    })
-                except Exception:
-                    continue
-            return rows
-
-        # parse header -> column mapping
-        ths = [th.get_text(strip=True).lower() for th in table.select("thead th")]
-        # fallback if header absent
-        colmap = {}
-        for i, th in enumerate(ths):
-            if "name" in th or "token" in th:
-                colmap["name"] = i
-            elif "symbol" in th:
-                colmap["symbol"] = i
-            elif "created" in th or "age" in th:
-                colmap["created"] = i
-            elif "txn" in th or "txns" in th or "tx" in th:
-                colmap["txns"] = i
-            elif "volume" in th or "vol" in th:
-                colmap["volume"] = i
-            elif "liquidity" in th or "liq" in th:
-                colmap["liquidity"] = i
-            elif "holders" in th or "holder" in th:
-                colmap["holders"] = i
-            elif "id" in th:
-                colmap["id"] = i
-
-        # parse rows
-        for tr in table.select("tbody tr"):
-            tds = tr.select("td")
-            if not tds:
-                continue
-            def get_col(key):
-                idx = colmap.get(key)
-                if idx is None or idx >= len(tds):
-                    return None
-                return tds[idx].get_text(strip=True)
-            # attempt to find a link or data-id for pool id
-            pid = tr.get("data-id") or tr.get("id")
-            if not pid:
-                a = tr.find("a", href=True)
-                if a and "/pools/" in a["href"]:
-                    pid = a["href"].split("/")[-1]
-            rows.append({
-                "id": pid,
-                "name": get_col("name"),
-                "symbol": get_col("symbol"),
-                "created": get_col("created"),
-                "txns": get_col("txns"),
-                "volume": get_col("volume"),
-                "liquidity": get_col("liquidity"),
-                "holders": get_col("holders"),
-            })
-        return rows
+        await client.send_message(CHANNEL, text, parse_mode="Markdown")
+        print(f"[{datetime.now()}] ✅ Alert sent for {symbol} ({alert_type})")
     except Exception as e:
-        print("⚠️ scrape error:", e)
+        print(f"[{datetime.now()}] ⚠️ Telegram Error: {e}")
+
+# -----------------------------
+# SCRAPE PUMP.FUN
+# -----------------------------
+def fetch_coins():
+    try:
+        r = requests.get(PUMP_FUN_URL, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        coins = []
+        if table:
+            rows = table.find_all("tr")[1:]  # skip header
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) < 5:
+                    continue
+                coin_name = cols[1].text.strip()
+                symbol = cols[2].text.strip()
+                txns = int(cols[3].text.strip() or 0)
+                mcap_text = cols[4].text.strip().replace("$","").replace(",","")
+                try:
+                    mcap = float(mcap_text)
+                except:
+                    mcap = 0
+                coin_id = f"{coin_name}_{symbol}"
+                coins.append({
+                    "id": coin_id,
+                    "name": coin_name,
+                    "symbol": symbol,
+                    "txns": txns,
+                    "mcap": mcap
+                })
+        return coins
+    except Exception as e:
+        print(f"[{datetime.now()}] ⚠️ Error fetching Pump.Fun: {e}")
         return []
 
-# ---------------------------
-# Main analysis loop
-# ---------------------------
+# -----------------------------
+# MONITOR LOOP
+# -----------------------------
 async def monitor_loop():
-    print("🚀 PumpFun scout started — scraping:", PUMPFUN_URL)
+    print(f"[{datetime.now()}] 🔍 PumpFun Bot Started")
     while True:
-        try:
-            rows = scrape_pumpfun_table()
-            now_ts = datetime.now().timestamp()
-            for row in rows:
-                pool_id = row.get("id") or (row.get("symbol") or row.get("name"))
-                # parse numeric fields
-                txns = safe_int(row.get("txns"))
-                vol = safe_float(row.get("volume"))
-                liq = safe_float(row.get("liquidity"))
-                holders = safe_int(row.get("holders"))
+        coins = fetch_coins()
+        for c in coins:
+            coin_id = c["id"]
+            txns = c["txns"]
+            mcap = c["mcap"]
+            coin_link = f"https://pump.fun/?coin={coin_id}"
 
-                # parse created -> age in minutes
-                created_ts = parse_iso_or_timestamp(row.get("created") or "")
-                if created_ts:
-                    age_min = max(0.0, (now_ts - created_ts) / 60.0)
-                else:
-                    # fallback: if not available, assume older
-                    age_min = 99999.0
+            if coin_id not in seen:
+                # First time seeing the coin
+                seen[coin_id] = {"txns": txns, "mcap": mcap}
+                if txns >= 1 and mcap >= 5000:
+                    await send_alert(c["name"], c["symbol"], txns, mcap, coin_link, "NEW GEM")
+            else:
+                prev = seen[coin_id]
+                txn_delta = txns - prev["txns"]
+                mcap_delta = mcap - prev["mcap"]
 
-                # compute score
-                score = score_coin(age_min, txns, vol, liq, holders)
-                # debug log
-                print(f"[{datetime.now()}] {row.get('symbol') or row.get('name')} id={pool_id} txns={txns} vol={vol} liq={liq} holders={holders} age_min={age_min:.1f} score={score:.1f}")
+                txn_growth = txn_delta
+                mcap_growth_percent = (mcap_delta / prev["mcap"] * 100) if prev["mcap"] > 0 else 0
 
-                # decide whether to post
-                if pool_id and pool_id not in posted and score >= SCORE_THRESHOLD:
-                    # compose message
-                    title = row.get("symbol") or row.get("name") or pool_id
-                    msg = (
-                        f"🚨 *Potential Pump Candidate*\n\n"
-                        f"💎 {title}\n"
-                        f"🔢 Txns: {txns}\n"
-                        f"💰 Volume(24h): ${vol:,.2f}\n"
-                        f"🌊 Liquidity: ${liq:,.2f}\n"
-                        f"👥 Holders: {holders}\n"
-                        f"⏱ Age (min): {age_min:.1f}\n"
-                        f"🏷 Score: {score:.1f}/100\n"
-                        f"🔗 https://pump.fun/?view=table&coins_sort=created_timestamp"
+                # Spike or growth alert
+                if txn_delta >= TXN_SPIKE or mcap_delta >= MCAP_SPIKE or txn_growth >= TXN_GROWTH_MULTIPLIER or mcap_growth_percent >= MCAP_GROWTH_PERCENT:
+                    await send_alert(
+                        c["name"], c["symbol"], txns, mcap, coin_link,
+                        alert_type="POTENTIAL PUMP",
+                        growth_txn=txn_delta,
+                        growth_mcap=mcap_delta
                     )
-                    # send to Telegram (async)
-                    try:
-                        await client.send_message(CHANNEL, msg)
-                        print(f"✅ Posted candidate {title} score={score:.1f}")
-                        posted.add(pool_id)
-                    except Exception as e:
-                        print("⚠️ Telegram send error:", e)
-            # housekeeping: decay posted set over time (optional)
-            # keep posted only recent ones (not implemented here - simple forever)
-        except Exception as e:
-            print("⚠️ monitor loop error:", e)
+                    seen[coin_id] = {"txns": txns, "mcap": mcap}
+
+        print(f"[{datetime.now()}] ℹ️ Checked pools, total seen={len(seen)}")
         await asyncio.sleep(POLL_DELAY)
 
-# ---------------------------
-# Flask keepalive
-# ---------------------------
-@app.route("/health")
-def health():
-    return "ok"
+# -----------------------------
+# TELEGRAM /start COMMAND
+# -----------------------------
+@client.on(events.NewMessage(pattern="/start"))
+async def start(event):
+    user = event.sender_id
+    print(f"[{datetime.now()}] /start used by {user}")
+    await event.reply(
+        "🤖 PumpFun Bot is running!\n"
+        "🔍 Monitoring new coins & spikes for potential pumps.\n"
+        "✅ Bot online.",
+        buttons=[
+            [Button.url("Join Channel", "https://t.me/pumpfun")],
+            [Button.url("Pump.Fun", "https://pump.fun/")]
+        ]
+    )
 
-def run_flask():
-    port = int(os.getenv("PORT", 10000))
-    # run flask in a thread; small risk: development server warning — fine for keep-alive
-    app.run(host="0.0.0.0", port=port)
-
-# ---------------------------
-# Entrypoint (safe asyncio loop + flask thread)
-# ---------------------------
-def start_bot():
+# -----------------------------
+# RUN BOT & KEEP-ALIVE
+# -----------------------------
+def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(client.start(bot_token=BOT_TOKEN))
-    print("🤖 Telegram bot started")
     loop.create_task(monitor_loop())
-    try:
-        loop.run_forever()
-    finally:
-        try:
-            loop.run_until_complete(client.disconnect())
-        except Exception:
-            pass
-        loop.close()
+    print(f"[{datetime.now()}] 🤖 Telegram bot starting...")
+    client.run_until_disconnected()
 
 if __name__ == "__main__":
-    # launch flask keepalive
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    threading.Thread(target=keep_alive).start()
     time.sleep(1)
-    # start telegram + monitor in current process (new event loop)
-    start_bot()
+    print(f"[{datetime.now()}] 🚀 Starting async bot loop now...")
+    run_bot()
