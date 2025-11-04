@@ -1,3 +1,4 @@
 telethon
-requests
 flask
+requests
+beautifulsoup4
