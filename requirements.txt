@@ -2,3 +2,4 @@ telethon
 flask
 requests
 beautifulsoup4
+lxml
