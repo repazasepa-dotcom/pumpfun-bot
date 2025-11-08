@@ -1,146 +1,133 @@
 #!/usr/bin/env python3
 import os
 import asyncio
-import aiohttp
-from aiohttp import web
-from telegram import Bot
+import requests
+from telethon import TelegramClient, events
+from flask import Flask
+import threading
+import json
+from datetime import datetime
 
 # -----------------------------
-# CONFIG / ENV
+# ENVIRONMENT VARIABLES
 # -----------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("CHANNEL")  # numeric ID or "@channelusername"
-GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/pools"
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 10))
-PORT = int(os.getenv("PORT", 10000))
-HOST = "0.0.0.0"
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHANNEL_ID = -1003219642022  # your public channel
+POSTED_FILE = "posted_coins.json"
 
-# -----------------------------
-# GLOBALS
-# -----------------------------
-seen_pools = {}  # pool_id -> {"txns": int, "mcap": float, "liquidity": float}
-_bot = None
-_client_session = None
-
-# -----------------------------
-# TELEGRAM POST FUNCTION
-# -----------------------------
-async def post_to_channel(token, pool_id, reason="Potential Pump"):
-    symbol = token.get("symbol", "Unknown")
-    name = token.get("name", "Unknown")
-    base_token = token.get("base_token_symbol", "Unknown")
-    txns = int(token.get("txn_count") or token.get("txns") or 0)
-    mcap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
-
-    msg = (
-        f"🚨 **MEME COIN ALERT!** 🚨\n\n"
-        f"Token: {symbol} | {name}\n"
-        f"Base Token: {base_token}\n"
-        f"Transactions: {txns}\n"
-        f"Market Cap: ${round(mcap,2)}\n"
-        f"Pool ID: {pool_id}\n"
-        f"Reason: {reason}\n"
-        f"Chart: https://www.geckoterminal.com/solana/pools/{pool_id}"
-    )
-
-    try:
-        await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
-        print(f"✅ Alert sent for {symbol} ({pool_id})")
-    except Exception as e:
-        print(f"⚠️ Telegram error: {e}")
+# Load posted coins
+if os.path.exists(POSTED_FILE):
+    with open(POSTED_FILE, "r") as f:
+        POSTED_COINS = json.load(f)
+else:
+    POSTED_COINS = []
 
 # -----------------------------
-# FETCH POOLS
+# TELEGRAM CLIENT
 # -----------------------------
-async def fetch_pools():
-    global _client_session
-    if _client_session is None:
-        _client_session = aiohttp.ClientSession()
-    try:
-        async with _client_session.get(GECKO_URL, timeout=20) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("data", [])
-            print(f"⚠️ GeckoTerminal API returned status {resp.status}")
-            return []
-    except Exception as e:
-        print(f"⚠️ Error fetching pools: {e}")
-        return []
+client = TelegramClient("pre_pump_session", API_ID, API_HASH)
 
 # -----------------------------
-# MONITOR LOOP (MEME PUMP DETECTION)
+# FLASK KEEP-ALIVE (Render)
 # -----------------------------
-async def monitor_pools():
-    global seen_pools
-    print("🚀 Monitoring Solana pools for potential meme coin pumps...")
+app = Flask(__name__)
+@app.route("/")
+def home():
+    return "✅ Pre-Pump Scanner Bot Running"
 
-    while True:
-        pools = await fetch_pools()
-
-        for pool in pools:
-            token = pool.get("attributes", {})
-            pool_id = pool.get("id")
-            if not pool_id:
-                continue
-
-            try:
-                txns = int(token.get("txn_count") or token.get("txns") or 0)
-                mcap = float(token.get("market_cap_usd") or token.get("liquidity_usd") or 0)
-                liquidity = float(token.get("liquidity_usd") or 0)
-            except (ValueError, TypeError):
-                continue
-
-            prev = seen_pools.get(pool_id)
-            if not prev:
-                seen_pools[pool_id] = {"txns": txns, "mcap": mcap, "liquidity": liquidity}
-                continue
-
-            prev_txns = int(prev["txns"])
-            prev_mcap = float(prev["mcap"])
-            prev_liquidity = float(prev["liquidity"])
-
-            reason = None
-
-            # MEME PUMP DETECTION LOGIC
-            if (txns - prev_txns >= 5) and (mcap - prev_mcap >= 5000):
-                reason = "High txn spike + Market Cap surge"
-            elif (liquidity - prev_liquidity >= 10000):
-                reason = "Liquidity surge detected"
-            elif (txns >= 10 and mcap < 20000):
-                reason = "Low cap high txn activity (classic meme pump)"
-
-            if reason:
-                await post_to_channel(token, pool_id, reason)
-
-            # update seen_pools
-            seen_pools[pool_id] = {"txns": txns, "mcap": mcap, "liquidity": liquidity}
-
-        await asyncio.sleep(POLL_INTERVAL)
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 # -----------------------------
-# AIOHTTP KEEP-ALIVE
+# HELPER FUNCTIONS
 # -----------------------------
-async def handle_health(request):
-    return web.Response(text="OK")
-
-async def start_app():
-    global _bot
-    if TELEGRAM_BOT_TOKEN:
-        _bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        # Startup message
+async def fetch_new_coins(per_page=50, total_pages=3, spacing=2):
+    coins = []
+    for page in range(1, total_pages+1):
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": per_page,
+            "page": page,
+            "sparkline": "false"
+        }
         try:
-            await _bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ Meme Pump Bot started & monitoring GeckoTerminal!")
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            coins.extend(response.json())
         except Exception as e:
-            print(f"⚠️ Failed startup message: {e}")
+            print(f"[{datetime.utcnow()}] ❌ Fetch error page {page}: {e}")
+        await asyncio.sleep(spacing)
+    return coins
 
-    asyncio.create_task(monitor_pools())
+async def post_signal(c):
+    global POSTED_COINS
+    coin_id = c["id"]
+    if coin_id in POSTED_COINS:
+        return
+    name = c["name"]
+    symbol = c["symbol"].upper()
+    volume = c.get("total_volume", 0)
+    cg_link = f"https://www.coingecko.com/en/coins/{coin_id}"
+    msg = f"🚀 {name} ({symbol})\nVolume: ${volume:,}\n{cg_link}"
+    await client.send_message(CHANNEL_ID, msg)
+    POSTED_COINS.append(coin_id)
+    if len(POSTED_COINS) > 50:  # keep history
+        POSTED_COINS.pop(0)
+    with open(POSTED_FILE, "w") as f:
+        json.dump(POSTED_COINS, f)
 
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    return app
+# -----------------------------
+# SCAN AND POST NEW COINS
+# -----------------------------
+async def scan_and_post():
+    coins = await fetch_new_coins()
+    candidates = []
+
+    for c in coins:
+        if c.get("total_volume",0) < 100_000:  # only coins with volume >= 100k
+            continue
+        if c["id"] in POSTED_COINS:
+            continue
+        candidates.append(c)
+
+    # Post up to 7 coins
+    posted = 0
+    for coin in candidates:
+        if posted >= 7:
+            break
+        await post_signal(coin)
+        posted += 1
+
+    if posted == 0:
+        await client.send_message(CHANNEL_ID, "❌ No new coins found with volume >= $100k.")
+
+# -----------------------------
+# TELEGRAM /signal COMMAND
+# -----------------------------
+@client.on(events.NewMessage(pattern="/signal"))
+async def manual_trigger(event):
+    user_id = event.sender_id
+    # Optional: allow only admin if you want
+    # if user_id != ADMIN_ID:
+    #     await event.reply("❌ You are not authorized.")
+    #     return
+    await event.reply("⏳ Manual scan started — looking for up to 7 new coin(s). This may take a few minutes...")
+    await scan_and_post()
+    await event.reply("✅ Manual scan completed.")
 
 # -----------------------------
 # MAIN
 # -----------------------------
+async def main():
+    await client.start(bot_token=BOT_TOKEN)
+    print("✅ Pre-Pump Scanner Bot is live")
+    await client.run_until_disconnected()
+
 if __name__ == "__main__":
-    web.run_app(start_app(), host=HOST, port=PORT)
+    threading.Thread(target=run_web, daemon=True).start()
+    asyncio.run(main())
