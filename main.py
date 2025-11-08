@@ -89,11 +89,19 @@ async def scan_and_post():
     candidates = []
 
     for c in coins:
-        if c.get("total_volume",0) < 100_000:  # only coins with volume >= 100k
+        volume = c.get("total_volume", 0)
+        # Only new coins with volume >=100k AND <=200k
+        if not (100_000 <= volume <= 200_000):
             continue
         if c["id"] in POSTED_COINS:
             continue
+        # Optional: momentum filter based on 24h price change
+        if c.get("price_change_percentage_24h") is None or c["price_change_percentage_24h"] < 5:
+            continue
         candidates.append(c)
+
+    # Sort by 24h gain descending (momentum)
+    candidates.sort(key=lambda x: x.get("price_change_percentage_24h", 0), reverse=True)
 
     # Post up to 7 coins
     posted = 0
@@ -104,7 +112,7 @@ async def scan_and_post():
         posted += 1
 
     if posted == 0:
-        await client.send_message(CHANNEL_ID, "❌ No new coins found with volume >= $100k.")
+        await client.send_message(CHANNEL_ID, "❌ No new coins found with volume $100k–$200k and positive momentum.")
 
 # -----------------------------
 # TELEGRAM /signal COMMAND
@@ -112,10 +120,6 @@ async def scan_and_post():
 @client.on(events.NewMessage(pattern="/signal"))
 async def manual_trigger(event):
     user_id = event.sender_id
-    # Optional: allow only admin if you want
-    # if user_id != ADMIN_ID:
-    #     await event.reply("❌ You are not authorized.")
-    #     return
     await event.reply("⏳ Manual scan started — looking for up to 7 new coin(s). This may take a few minutes...")
     await scan_and_post()
     await event.reply("✅ Manual scan completed.")
