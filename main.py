@@ -28,27 +28,20 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003219642022"))  # default to your c
 POSTED_FILE = os.getenv("POSTED_FILE", "posted_coins.json")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Dexscreener chains to scan (common ones). 'all' chosen earlier => use these.
 DEX_CHAINS = ["solana", "base", "bsc", "ethereum", "arbitrum", "polygon"]
-
-# Scan interval (seconds) - user requested 10 minutes
 SCAN_INTERVAL_SECONDS = 10 * 60
-
-# CoinGecko pages/per_page (tunable)
 CG_PER_PAGE = 50
 CG_PAGES = 3
 
-# Limits / filters
 CG_VOLUME_MIN = 100_000
 CG_VOLUME_MAX = 200_000
 CG_MARKET_CAP_MAX = 5_000_000
-CG_MOMENTUM_24H_MIN = 5.0  # percent
-CG_MOMENTUM_1H_MIN = 2.0   # percent
+CG_MOMENTUM_24H_MIN = 5.0
+CG_MOMENTUM_1H_MIN = 2.0
 
-# Dexscreener filters (example): liquidity/usd thresholds (tunable)
-DEX_LIQUIDITY_MIN = 1_000    # $1k min liquidity to avoid dust
-DEX_LIQUIDITY_MAX = 200_000  # broad upper bound, you can tune
-DEX_MIN_BUYS_H1 = 1          # at least 1 buy in last hour (tunable)
+DEX_LIQUIDITY_MIN = 1_000
+DEX_LIQUIDITY_MAX = 200_000
+DEX_MIN_BUYS_H1 = 1
 
 # -----------------------------
 # Persistence: posted history
@@ -62,11 +55,9 @@ if os.path.exists(POSTED_FILE):
 else:
     POSTED = []
 
-# normalize to set for quick checks
 POSTED_SET = set(POSTED)
 
 def save_posted():
-    # keep list form for readability
     try:
         with open(POSTED_FILE, "w") as f:
             json.dump(list(POSTED_SET), f)
@@ -92,7 +83,6 @@ def home():
     return "✅ Meme Coin Combo Scanner Running"
 
 def run_web():
-    # threaded to satisfy Render health checks
     app.run(host="0.0.0.0", port=PORT, threaded=True)
 
 # -----------------------------
@@ -102,7 +92,6 @@ def now_str():
     return datetime.now(UTC).isoformat()
 
 def safe_get(d, *keys, default=None):
-    """Safe nested get for dicts — returns default if any key missing."""
     cur = d
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
@@ -111,58 +100,42 @@ def safe_get(d, *keys, default=None):
     return cur
 
 # -----------------------------
-# Dexscreener: fetch new pairs for given chain
+# Dexscreener functions
 # -----------------------------
-DEX_BASE = "https://api.dexscreener.com/latest/dex/pairs/{}"  # chain slug
+DEX_BASE = "https://api.dexscreener.com/latest/dex/pairs/{}"
 
 def scan_dex_chain(chain):
-    """Synchronous fetch for a single chain's pairs from Dexscreener (used inside async wrapper)."""
-    url = DEX_BASE.format(chain)
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(DEX_BASE.format(chain), timeout=15)
         r.raise_for_status()
         data = r.json()
-        # Dexscreener returns top-level "pairs" list
-        pairs = data.get("pairs", []) if isinstance(data, dict) else []
-        return pairs
+        return data.get("pairs", []) if isinstance(data, dict) else []
     except Exception as e:
         print(f"[{now_str()}] ❌ Dexscreener fetch failed for {chain}: {e}")
         return []
 
 async def fetch_dex_new_pairs_all_chains():
-    """Async wrapper that fetches for all configured chains concurrently (using threadpool)."""
     loop = asyncio.get_running_loop()
     tasks = [loop.run_in_executor(None, scan_dex_chain, chain) for chain in DEX_CHAINS]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    pairs_by_chain = {}
-    for chain, res in zip(DEX_CHAINS, results):
-        if isinstance(res, Exception):
-            pairs_by_chain[chain] = []
-        else:
-            pairs_by_chain[chain] = res
-    return pairs_by_chain
+    return {chain: res if not isinstance(res, Exception) else [] for chain, res in zip(DEX_CHAINS, results)}
 
 def dex_pair_key(chain, pair):
-    """Create unique key for a pair to track posting history."""
-    # Dexscreener provides 'pairAddress' or 'pair' fields; fallback to baseToken+quoteToken
     addr = pair.get("pairAddress") or pair.get("pair")
     if addr:
         return f"dex:{chain}:{addr}"
-    # fallback:
     base = safe_get(pair, "baseToken", "address") or safe_get(pair, "baseToken", "symbol") or "unknown"
     quote = safe_get(pair, "quoteToken", "address") or safe_get(pair, "quoteToken", "symbol") or "unknown"
     return f"dex:{chain}:{base}/{quote}"
 
 def format_dex_message(chain, pair):
-    """Format Telegram message for a Dexscreener pair."""
-    base = safe_get(pair, "baseToken", "symbol") or (safe_get(pair, "baseToken", "name") or "UNKNOWN")
+    base = safe_get(pair, "baseToken", "symbol") or safe_get(pair, "baseToken", "name") or "UNKNOWN"
     name = safe_get(pair, "baseToken", "name") or base
     price = pair.get("priceUsd")
     liquidity = safe_get(pair, "liquidity", "usd", default=0) or pair.get("liquidityUsd", 0) or 0
     buys_h1 = safe_get(pair, "txns", "h1", "buys", default=0)
     sells_h1 = safe_get(pair, "txns", "h1", "sells", default=0)
     pair_url = pair.get("dexUrl") or pair.get("url") or pair.get("pairUrl") or ""
-    # pair creation time (if provided) — Dexscreener gives pairCreatedAt in seconds sometimes
     pair_created = pair.get("pairCreatedAt") or pair.get("createdAt") or None
     age_str = "unknown"
     if pair_created:
@@ -187,12 +160,11 @@ def format_dex_message(chain, pair):
     return msg
 
 # -----------------------------
-# CoinGecko: fetch markets
+# CoinGecko functions
 # -----------------------------
 CG_BASE = "https://api.coingecko.com/api/v3/coins/markets"
 
 def fetch_coingecko_markets(per_page=CG_PER_PAGE, total_pages=CG_PAGES):
-    """Sync fetch (wrapped in async) — returns list of coins"""
     all_coins = []
     for page in range(1, total_pages + 1):
         params = {
@@ -209,8 +181,6 @@ def fetch_coingecko_markets(per_page=CG_PER_PAGE, total_pages=CG_PAGES):
             all_coins.extend(r.json())
         except Exception as e:
             print(f"[{now_str()}] ❌ CoinGecko fetch error page {page}: {e}")
-        # small delay to be polite (Rate limit safety)
-        # we keep it synchronous inside this wrapper, sleep here minimally
     return all_coins
 
 def cg_coin_key(coin):
@@ -233,37 +203,23 @@ def format_cg_message(coin):
     return msg
 
 # -----------------------------
-# Scanning & posting logic
+# Scanning & posting
 # -----------------------------
 async def process_dexscreener():
-    """Fetch Dexscreener pairs across chains and post qualifying new pairs."""
+    posted_count = 0
     try:
         pairs_by_chain = await fetch_dex_new_pairs_all_chains()
-        posted_count = 0
         for chain, pairs in pairs_by_chain.items():
-            # iterate newest-first if Dexscreener returns that ordering
             for p in pairs:
                 key = dex_pair_key(chain, p)
                 if key in POSTED_SET:
                     continue
-                # liquidity detection (try a few fields)
                 liquidity = safe_get(p, "liquidity", "usd", default=0) or p.get("liquidityUsd") or 0
-                # volume last 24h (field may be volume.h24)
-                volume_h24 = safe_get(p, "volume", "h24", default=0) or safe_get(p, "volume", "h24Usd", default=0) or 0
-                # buys in last hour
                 buys_h1 = safe_get(p, "txns", "h1", "buys", default=0)
-                # quick filters:
-                if liquidity is None:
-                    liquidity = 0
-                if volume_h24 is None:
-                    volume_h24 = 0
-                # apply filters to avoid dust & huge projects
                 if not (DEX_LIQUIDITY_MIN <= float(liquidity) <= DEX_LIQUIDITY_MAX):
-                    # skip pairs with too little or too much liquidity
                     continue
                 if buys_h1 < DEX_MIN_BUYS_H1:
                     continue
-                # Passed filters -> post
                 msg = format_dex_message(chain, p)
                 try:
                     await client.send_message(CHANNEL_ID, msg)
@@ -271,19 +227,15 @@ async def process_dexscreener():
                     posted_count += 1
                 except Exception as e:
                     print(f"[{now_str()}] ❌ Failed to post dex pair {key}: {e}")
-                # limit spam per run (tunable)
                 if posted_count >= 10:
                     break
-            # small pause between chains to avoid burst
             await asyncio.sleep(0.5)
-        if posted_count == 0:
-            # optional: no dex pairs found — we won't spam channel with every run
-            pass
     except Exception as e:
         print(f"[{now_str()}] ❌ process_dexscreener error: {e}")
+    return posted_count
 
 async def process_coingecko():
-    """Fetch CoinGecko markets and post qualifying coins (momentum low-caps)."""
+    posted_count = 0
     try:
         loop = asyncio.get_running_loop()
         coins = await loop.run_in_executor(None, fetch_coingecko_markets)
@@ -294,7 +246,6 @@ async def process_coingecko():
             market_cap = coin.get("market_cap", 0) or 0
             p1 = coin.get("price_change_percentage_1h_in_currency") or 0
             p24 = coin.get("price_change_percentage_24h_in_currency") or 0
-            # filters
             if not (CG_VOLUME_MIN <= volume <= CG_VOLUME_MAX):
                 continue
             if key in POSTED_SET:
@@ -304,37 +255,38 @@ async def process_coingecko():
             if market_cap > CG_MARKET_CAP_MAX:
                 continue
             candidates.append((coin, max(p24, p1)))
-        # sort by best momentum
         candidates.sort(key=lambda x: x[1], reverse=True)
-        posted = 0
-        for coin, _score in candidates:
+        for coin, _ in candidates[:7]:
             key = cg_coin_key(coin)
             msg = format_cg_message(coin)
             try:
                 await client.send_message(CHANNEL_ID, msg)
                 mark_posted(key)
-                posted += 1
+                posted_count += 1
             except Exception as e:
                 print(f"[{now_str()}] ❌ Failed to post coingecko coin {key}: {e}")
-            if posted >= 7:
-                break
-        if posted == 0:
-            # send occasional no-results message? (disabled to avoid spam)
-            # await client.send_message(CHANNEL_ID, "❌ No new meme coins found from CoinGecko this run.")
-            pass
     except Exception as e:
         print(f"[{now_str()}] ❌ process_coingecko error: {e}")
+    return posted_count
 
 # -----------------------------
 # Combined scheduler
 # -----------------------------
 async def combo_scan_loop():
-    """Main recurring task that runs Dexscreener + CoinGecko scans every interval."""
     while True:
         try:
             print(f"[{now_str()}] ⏱️ Combo scan started...")
-            # run both scans concurrently
-            await asyncio.gather(process_dexscreener(), process_coingecko())
+            dex_task = asyncio.create_task(process_dexscreener())
+            cg_task = asyncio.create_task(process_coingecko())
+            results = await asyncio.gather(dex_task, cg_task)
+            dex_posted, cg_posted = results
+            if dex_posted == 0 and cg_posted == 0:
+                try:
+                    await client.send_message(CHANNEL_ID,
+                        "❌ No new meme coins found with volume $100k–$200k and positive momentum."
+                    )
+                except Exception as e:
+                    print(f"[{now_str()}] ❌ Failed to post no-results message: {e}")
             print(f"[{now_str()}] ✅ Combo scan completed.")
         except Exception as e:
             print(f"[{now_str()}] ❌ Combo scan error: {e}")
@@ -345,11 +297,14 @@ async def combo_scan_loop():
 # -----------------------------
 @client.on(events.NewMessage(pattern="/signal"))
 async def manual_trigger(event):
-    sender = event.sender_id
     try:
         await event.reply("⏳ Manual combo scan started — running Dexscreener + CoinGecko...")
-        await asyncio.gather(process_dexscreener(), process_coingecko())
+        dex_task = asyncio.create_task(process_dexscreener())
+        cg_task = asyncio.create_task(process_coingecko())
+        results = await asyncio.gather(dex_task, cg_task)
         await event.reply("✅ Manual scan completed.")
+        if sum(results) == 0:
+            await event.reply("❌ No new meme coins found with volume $100k–$200k and positive momentum.")
     except Exception as e:
         await event.reply(f"❌ Manual scan error: {e}")
 
@@ -359,14 +314,11 @@ async def manual_trigger(event):
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     print(f"[{now_str()}] ✅ Combo Meme Coin Scanner is live")
-    # start the recurring combo scan
     asyncio.create_task(combo_scan_loop())
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    # start web keep-alive thread for Render
     threading.Thread(target=run_web, daemon=True).start()
-    # run Telethon + scanning
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
