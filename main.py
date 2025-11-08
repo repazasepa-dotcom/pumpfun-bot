@@ -29,7 +29,8 @@ POSTED_FILE = os.getenv("POSTED_FILE", "posted_coins.json")
 PORT = int(os.environ.get("PORT", "10000"))
 
 DEX_CHAINS = ["solana", "base", "bsc", "ethereum", "arbitrum", "polygon"]
-SCAN_INTERVAL_SECONDS = 10 * 60
+SCAN_INTERVAL_SECONDS = 10 * 60  # 10 minutes
+
 CG_PER_PAGE = 50
 CG_PAGES = 3
 
@@ -100,16 +101,18 @@ def safe_get(d, *keys, default=None):
     return cur
 
 # -----------------------------
-# Dexscreener functions
+# Dexscreener
 # -----------------------------
 DEX_BASE = "https://api.dexscreener.com/latest/dex/pairs/{}"
 
 def scan_dex_chain(chain):
+    url = DEX_BASE.format(chain)
     try:
-        r = requests.get(DEX_BASE.format(chain), timeout=15)
+        r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
-        return data.get("pairs", []) if isinstance(data, dict) else []
+        pairs = data.get("pairs", []) if isinstance(data, dict) else []
+        return pairs
     except Exception as e:
         print(f"[{now_str()}] ❌ Dexscreener fetch failed for {chain}: {e}")
         return []
@@ -118,7 +121,13 @@ async def fetch_dex_new_pairs_all_chains():
     loop = asyncio.get_running_loop()
     tasks = [loop.run_in_executor(None, scan_dex_chain, chain) for chain in DEX_CHAINS]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    return {chain: res if not isinstance(res, Exception) else [] for chain, res in zip(DEX_CHAINS, results)}
+    pairs_by_chain = {}
+    for chain, res in zip(DEX_CHAINS, results):
+        if isinstance(res, Exception):
+            pairs_by_chain[chain] = []
+        else:
+            pairs_by_chain[chain] = res
+    return pairs_by_chain
 
 def dex_pair_key(chain, pair):
     addr = pair.get("pairAddress") or pair.get("pair")
@@ -129,7 +138,7 @@ def dex_pair_key(chain, pair):
     return f"dex:{chain}:{base}/{quote}"
 
 def format_dex_message(chain, pair):
-    base = safe_get(pair, "baseToken", "symbol") or safe_get(pair, "baseToken", "name") or "UNKNOWN"
+    base = safe_get(pair, "baseToken", "symbol") or (safe_get(pair, "baseToken", "name") or "UNKNOWN")
     name = safe_get(pair, "baseToken", "name") or base
     price = pair.get("priceUsd")
     liquidity = safe_get(pair, "liquidity", "usd", default=0) or pair.get("liquidityUsd", 0) or 0
@@ -159,8 +168,39 @@ def format_dex_message(chain, pair):
     )
     return msg
 
+async def process_dexscreener():
+    try:
+        pairs_by_chain = await fetch_dex_new_pairs_all_chains()
+        posted_count = 0
+        for chain, pairs in pairs_by_chain.items():
+            for p in pairs:
+                key = dex_pair_key(chain, p)
+                if key in POSTED_SET:
+                    continue
+                liquidity = safe_get(p, "liquidity", "usd", default=0) or p.get("liquidityUsd") or 0
+                volume_h24 = safe_get(p, "volume", "h24", default=0) or safe_get(p, "volume", "h24Usd", default=0) or 0
+                buys_h1 = safe_get(p, "txns", "h1", "buys", default=0)
+                if not (DEX_LIQUIDITY_MIN <= float(liquidity) <= DEX_LIQUIDITY_MAX):
+                    continue
+                if buys_h1 < DEX_MIN_BUYS_H1:
+                    continue
+                msg = format_dex_message(chain, p)
+                try:
+                    await client.send_message(CHANNEL_ID, msg)
+                    mark_posted(key)
+                    posted_count += 1
+                except Exception as e:
+                    print(f"[{now_str()}] ❌ Failed to post dex pair {key}: {e}")
+                if posted_count >= 10:
+                    break
+            await asyncio.sleep(0.5)
+        return posted_count
+    except Exception as e:
+        print(f"[{now_str()}] ❌ process_dexscreener error: {e}")
+        return 0
+
 # -----------------------------
-# CoinGecko functions
+# CoinGecko
 # -----------------------------
 CG_BASE = "https://api.coingecko.com/api/v3/coins/markets"
 
@@ -202,40 +242,7 @@ def format_cg_message(coin):
     )
     return msg
 
-# -----------------------------
-# Scanning & posting
-# -----------------------------
-async def process_dexscreener():
-    posted_count = 0
-    try:
-        pairs_by_chain = await fetch_dex_new_pairs_all_chains()
-        for chain, pairs in pairs_by_chain.items():
-            for p in pairs:
-                key = dex_pair_key(chain, p)
-                if key in POSTED_SET:
-                    continue
-                liquidity = safe_get(p, "liquidity", "usd", default=0) or p.get("liquidityUsd") or 0
-                buys_h1 = safe_get(p, "txns", "h1", "buys", default=0)
-                if not (DEX_LIQUIDITY_MIN <= float(liquidity) <= DEX_LIQUIDITY_MAX):
-                    continue
-                if buys_h1 < DEX_MIN_BUYS_H1:
-                    continue
-                msg = format_dex_message(chain, p)
-                try:
-                    await client.send_message(CHANNEL_ID, msg)
-                    mark_posted(key)
-                    posted_count += 1
-                except Exception as e:
-                    print(f"[{now_str()}] ❌ Failed to post dex pair {key}: {e}")
-                if posted_count >= 10:
-                    break
-            await asyncio.sleep(0.5)
-    except Exception as e:
-        print(f"[{now_str()}] ❌ process_dexscreener error: {e}")
-    return posted_count
-
 async def process_coingecko():
-    posted_count = 0
     try:
         loop = asyncio.get_running_loop()
         coins = await loop.run_in_executor(None, fetch_coingecko_markets)
@@ -256,60 +263,56 @@ async def process_coingecko():
                 continue
             candidates.append((coin, max(p24, p1)))
         candidates.sort(key=lambda x: x[1], reverse=True)
-        for coin, _ in candidates[:7]:
+        posted = 0
+        for coin, _score in candidates:
             key = cg_coin_key(coin)
             msg = format_cg_message(coin)
             try:
                 await client.send_message(CHANNEL_ID, msg)
                 mark_posted(key)
-                posted_count += 1
+                posted += 1
             except Exception as e:
                 print(f"[{now_str()}] ❌ Failed to post coingecko coin {key}: {e}")
+            if posted >= 7:
+                break
+        return posted
     except Exception as e:
         print(f"[{now_str()}] ❌ process_coingecko error: {e}")
-    return posted_count
+        return 0
 
 # -----------------------------
-# Combined scheduler
+# Combined loop
 # -----------------------------
 async def combo_scan_loop():
     while True:
         try:
             print(f"[{now_str()}] ⏱️ Combo scan started...")
-            dex_task = asyncio.create_task(process_dexscreener())
-            cg_task = asyncio.create_task(process_coingecko())
-            results = await asyncio.gather(dex_task, cg_task)
-            dex_posted, cg_posted = results
-            if dex_posted == 0 and cg_posted == 0:
-                try:
-                    await client.send_message(CHANNEL_ID,
-                        "❌ No new meme coins found with volume $100k–$200k and positive momentum."
-                    )
-                except Exception as e:
-                    print(f"[{now_str()}] ❌ Failed to post no-results message: {e}")
+            dex_posted, cg_posted = await asyncio.gather(process_dexscreener(), process_coingecko())
+            if dex_posted + cg_posted == 0:
+                await client.send_message(CHANNEL_ID, "❌ No new meme coins found with volume $100k–$200k and positive momentum.")
             print(f"[{now_str()}] ✅ Combo scan completed.")
         except Exception as e:
             print(f"[{now_str()}] ❌ Combo scan error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 # -----------------------------
-# Manual trigger via /signal
+# Manual /signal
 # -----------------------------
 @client.on(events.NewMessage(pattern="/signal"))
 async def manual_trigger(event):
+    sender = event.sender_id
     try:
         await event.reply("⏳ Manual combo scan started — running Dexscreener + CoinGecko...")
-        dex_task = asyncio.create_task(process_dexscreener())
-        cg_task = asyncio.create_task(process_coingecko())
-        results = await asyncio.gather(dex_task, cg_task)
-        await event.reply("✅ Manual scan completed.")
-        if sum(results) == 0:
+        dex_posted, cg_posted = await asyncio.gather(process_dexscreener(), process_coingecko())
+        if dex_posted + cg_posted == 0:
             await event.reply("❌ No new meme coins found with volume $100k–$200k and positive momentum.")
+        else:
+            await event.reply(f"✅ Manual scan completed — {dex_posted + cg_posted} coin(s) posted.")
     except Exception as e:
         await event.reply(f"❌ Manual scan error: {e}")
 
 # -----------------------------
-# Main startup
+# Main
 # -----------------------------
 async def main():
     await client.start(bot_token=BOT_TOKEN)
