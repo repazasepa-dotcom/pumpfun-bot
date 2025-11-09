@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Combo Meme Coin Scanner
-- Dexscreener: early pair detection across many chains
-- CoinGecko: momentum low-cap detection
-- Posts to a Telegram channel via Telethon
+Combo Meme Coin Scanner (Updated)
+- Dexscreener: uses trending feed to detect newly launched pairs (<24h)
+- CoinGecko: momentum low-cap detection (backup)
+- Posts top 3 new DexScreener pairs per scan to public channel
 - Flask keep-alive for Render
 """
 import os
@@ -24,32 +24,36 @@ UTC = timezone.utc
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003219642022"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003219642022"))  # public channel only
 POSTED_FILE = os.getenv("POSTED_FILE", "posted_coins.json")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Correct Dexscreener chain slugs
-DEX_CHAINS = ["ethereum", "bsc", "arbitrum", "polygon-pos", "solana", "base"]
+# Scanning settings
+SCAN_INTERVAL_SECONDS = 10 * 60  # 10 minutes
 
-SCAN_INTERVAL_SECONDS = 10 * 60  # every 10 minutes
-
-# CoinGecko scan
+# CoinGecko (backup momentum) settings
 CG_PER_PAGE = 50
-CG_PAGES = 2  # reduce pages to avoid 429
+CG_PAGES = 1   # keep small to avoid 429
+CG_PAGE_DELAY = 2  # seconds delay between page requests
 
-# Filters
+# Filters / thresholds
 CG_VOLUME_MIN = 100_000
 CG_VOLUME_MAX = 200_000
 CG_MARKET_CAP_MAX = 5_000_000
 CG_MOMENTUM_24H_MIN = 5.0
 CG_MOMENTUM_1H_MIN = 2.0
 
-DEX_LIQUIDITY_MIN = 1_000
-DEX_LIQUIDITY_MAX = 200_000
+DEX_LIQUIDITY_MIN = 1_000     # $1k
+DEX_LIQUIDITY_MAX = 200_000   # $200k
 DEX_MIN_BUYS_H1 = 1
+DEX_MAX_AGE_HOURS = 24        # only <24h old for Dex trending posts
+DEX_TOP_N = 3                 # post top 3 per scan
+
+# Dexscreener trending endpoint
+DEX_TRENDING_URL = "https://api.dexscreener.com/latest/dex/trending"
 
 # -----------------------------
-# Persistence
+# Persistence: posted history
 # -----------------------------
 if os.path.exists(POSTED_FILE):
     try:
@@ -104,76 +108,160 @@ def safe_get(d, *keys, default=None):
         cur = cur[k]
     return cur
 
-# -----------------------------
-# Dexscreener
-# -----------------------------
-DEX_BASE = "https://api.dexscreener.com/latest/dex/pairs/{}"
-
-def scan_dex_chain(chain):
-    url = DEX_BASE.format(chain)
+def dex_trending_fetch():
+    """Fetch trending feed from Dexscreener (synchronous)."""
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(DEX_TRENDING_URL, timeout=15)
         r.raise_for_status()
         data = r.json()
-        pairs = data.get("pairs", []) if isinstance(data, dict) else []
-        return pairs
+        # Dexscreener trending may return dict with 'pairs' or a top-level list; handle both
+        if isinstance(data, dict) and "pairs" in data:
+            return data["pairs"]
+        if isinstance(data, list):
+            return data
+        # fallback: try to find pairs in keys
+        for v in data.values() if isinstance(data, dict) else []:
+            if isinstance(v, list):
+                return v
+        return []
     except Exception as e:
-        print(f"[{now_str()}] ❌ Dexscreener fetch failed for {chain}: {e}")
+        print(f"[{now_str()}] ❌ Dexscreener trending fetch failed: {e}")
         return []
 
-async def fetch_dex_new_pairs_all_chains():
-    loop = asyncio.get_running_loop()
-    tasks = [loop.run_in_executor(None, scan_dex_chain, chain) for chain in DEX_CHAINS]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    pairs_by_chain = {}
-    for chain, res in zip(DEX_CHAINS, results):
-        if isinstance(res, Exception):
-            pairs_by_chain[chain] = []
-        else:
-            pairs_by_chain[chain] = res
-    return pairs_by_chain
-
-def dex_pair_key(chain, pair):
+# -----------------------------
+# Dexscreener processing (trending)
+# -----------------------------
+def dex_pair_unique_key(pair):
+    """Unique key for a pair from Dexscreener to avoid reposts."""
+    # Prefer pairAddress or pair
     addr = pair.get("pairAddress") or pair.get("pair")
     if addr:
-        return f"dex:{chain}:{addr}"
-    base = safe_get(pair, "baseToken", "address") or safe_get(pair, "baseToken", "symbol") or "unknown"
-    quote = safe_get(pair, "quoteToken", "address") or safe_get(pair, "quoteToken", "symbol") or "unknown"
+        return f"dex:{addr}"
+    # fallback to chain + base + quote
+    chain = pair.get("chain") or pair.get("chainName") or "unknown"
+    base = safe_get(pair, "baseToken", "address") or safe_get(pair, "baseToken", "symbol") or "base"
+    quote = safe_get(pair, "quoteToken", "address") or safe_get(pair, "quoteToken", "symbol") or "quote"
     return f"dex:{chain}:{base}/{quote}"
 
-def format_dex_message(chain, pair):
-    base = safe_get(pair, "baseToken", "symbol") or (safe_get(pair, "baseToken", "name") or "UNKNOWN")
-    name = safe_get(pair, "baseToken", "name") or base
+def dex_pair_age_hours(pair):
+    """Return age in hours if pairCreatedAt exists, else None."""
+    pair_created = pair.get("pairCreatedAt") or pair.get("createdAt") or None
+    if not pair_created:
+        return None
+    try:
+        ts = int(pair_created)
+        dt = datetime.fromtimestamp(ts, tz=UTC)
+        age = datetime.now(UTC) - dt
+        return age.total_seconds() / 3600.0
+    except Exception:
+        return None
+
+def dex_pair_volume(pair):
+    """Prefer volume.h24 or liquidity as ranking metric (float)."""
+    v = safe_get(pair, "volume", "h24") or safe_get(pair, "volume", "h24Usd") or safe_get(pair, "volumeUsd", None)
+    if not v:
+        # fallback to liquidity usd
+        v = safe_get(pair, "liquidity", "usd") or pair.get("liquidityUsd") or 0
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return 0.0
+
+def format_dex_trending_msg(pair):
+    chain = pair.get("chain") or pair.get("chainName") or "unknown"
+    base_sym = safe_get(pair, "baseToken", "symbol") or safe_get(pair, "baseToken", "name") or "UNKNOWN"
+    base_name = safe_get(pair, "baseToken", "name") or base_sym
     price = pair.get("priceUsd")
-    liquidity = safe_get(pair, "liquidity", "usd", default=0) or pair.get("liquidityUsd", 0) or 0
-    buys_h1 = safe_get(pair, "txns", "h1", "buys", default=0)
-    sells_h1 = safe_get(pair, "txns", "h1", "sells", default=0)
+    liquidity = safe_get(pair, "liquidity", "usd", default=0) or pair.get("liquidityUsd") or 0
+    vol24 = safe_get(pair, "volume", "h24", default=0) or safe_get(pair, "volume", "h24Usd", default=0) or 0
+    p1 = safe_get(pair, "priceChange", "h1") or safe_get(pair, "priceChange1h") or 0
+    p24 = safe_get(pair, "priceChange", "h24") or safe_get(pair, "priceChange24h") or 0
     pair_url = pair.get("dexUrl") or pair.get("url") or pair.get("pairUrl") or ""
     pair_created = pair.get("pairCreatedAt") or pair.get("createdAt") or None
-    age_str = "unknown"
+    launch_time = "unknown"
     if pair_created:
         try:
             dt = datetime.fromtimestamp(int(pair_created), tz=UTC)
-            age = datetime.now(UTC) - dt
-            if age < timedelta(minutes=1):
-                age_str = f"{int(age.total_seconds())}s"
-            elif age < timedelta(hours=1):
-                age_str = f"{int(age.total_seconds()//60)}m"
-            else:
-                age_str = f"{int(age.total_seconds()//3600)}h"
-        except:
-            age_str = "unknown"
+            launch_time = dt.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
     msg = (
-        f"🧪 New Pair Detected ({chain.upper()})\n"
-        f"{name} ({base})\n"
-        f"Price: ${price if price is not None else 'N/A'} | Liquidity: ${int(liquidity):,}\n"
-        f"Buys(1h): {buys_h1} | Sells(1h): {sells_h1} | Age: {age_str}\n"
-        f"{pair_url}\n\n⚠️ Early-stage token — DYOR before interacting."
+        f"🚀 New Meme Pair (<24h) — {chain.upper()}\n"
+        f"{base_name} ({base_sym})\n"
+        f"Price: ${price if price is not None else 'N/A'} | Volume(24h): ${int(float(vol24)):,} | Liquidity: ${int(float(liquidity)):,}\n"
+        f"1h / 24h: {float(p1):.2f}% / {float(p24):.2f}%\n"
+        f"Launch: {launch_time}\n"
+        f"{pair_url}\n\n⚠️ Extremely early-stage token — DYOR before interacting."
     )
     return msg
 
+async def process_dex_trending():
+    """
+    Fetch trending feed, filter newly launched (<24h), apply liquidity/buys filters,
+    rank by 24h volume and post top N to public channel.
+    Returns number posted.
+    """
+    posted = 0
+    try:
+        # fetch trending pairs
+        loop = asyncio.get_running_loop()
+        pairs = await loop.run_in_executor(None, dex_trending_fetch)
+        if not pairs:
+            return 0
+
+        # filter & score
+        candidates = []
+        for p in pairs:
+            # unique key
+            key = dex_pair_unique_key(p)
+            if key in POSTED_SET:
+                continue
+            # age < 24h
+            age_h = dex_pair_age_hours(p)
+            if age_h is None or age_h > DEX_MAX_AGE_HOURS:
+                continue
+            # liquidity & buys
+            liquidity = safe_get(p, "liquidity", "usd", default=0) or p.get("liquidityUsd") or 0
+            buys_h1 = safe_get(p, "txns", "h1", "buys", default=0) or safe_get(p, "txns", "h1Buys", default=0) or 0
+            try:
+                liquidity_val = float(liquidity)
+            except Exception:
+                liquidity_val = 0.0
+            if not (DEX_LIQUIDITY_MIN <= liquidity_val <= DEX_LIQUIDITY_MAX):
+                continue
+            if int(buys_h1) < DEX_MIN_BUYS_H1:
+                continue
+            # use 24h volume or liquidity to score
+            score = dex_pair_volume(p)
+            candidates.append((score, key, p))
+
+        if not candidates:
+            return 0
+
+        # top by score descending
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top = candidates[:DEX_TOP_N]
+
+        # post each
+        for score, key, pair in top:
+            msg = format_dex_trending_msg(pair)
+            try:
+                await client.send_message(CHANNEL_ID, msg)
+                mark_posted(key)
+                posted += 1
+            except Exception as e:
+                print(f"[{now_str()}] ❌ Failed to post trending pair {key}: {e}")
+
+        return posted
+    except Exception as e:
+        print(f"[{now_str()}] ❌ process_dex_trending error: {e}")
+        return 0
+
 # -----------------------------
-# CoinGecko
+# CoinGecko (backup momentum)
 # -----------------------------
 CG_BASE = "https://api.coingecko.com/api/v3/coins/markets"
 
@@ -194,13 +282,17 @@ def fetch_coingecko_markets(per_page=CG_PER_PAGE, total_pages=CG_PAGES):
             all_coins.extend(r.json())
         except Exception as e:
             print(f"[{now_str()}] ❌ CoinGecko fetch error page {page}: {e}")
-        asyncio.sleep(2)  # rate limit safety
+        # polite delay to avoid 429
+        try:
+            asyncio.sleep(CG_PAGE_DELAY)
+        except Exception:
+            pass
     return all_coins
 
 def cg_coin_key(coin):
     return f"cg:{coin.get('id')}"
 
-def format_cg_message(coin):
+def format_cg_msg(coin):
     name = coin.get("name")
     symbol = (coin.get("symbol") or "").upper()
     volume = coin.get("total_volume", 0) or 0
@@ -209,106 +301,89 @@ def format_cg_message(coin):
     p24 = coin.get("price_change_percentage_24h_in_currency") or 0
     cg_link = f"https://www.coingecko.com/en/coins/{coin.get('id')}"
     msg = (
-        f"🚀 {name} ({symbol})\n"
+        f"📈 CoinGecko Momentum\n"
+        f"{name} ({symbol})\n"
         f"Volume: ${int(volume):,} | Market Cap: ${int(market_cap):,}\n"
-        f"1h Gain: {p1:.2f}% | 24h Gain: {p24:.2f}%\n"
+        f"1h / 24h: {p1:.2f}% / {p24:.2f}%\n"
         f"{cg_link}\n\n⚠️ Informational only. DYOR."
     )
     return msg
 
-# -----------------------------
-# Scan & Post Logic
-# -----------------------------
-async def process_dexscreener(posted_counter):
-    pairs_by_chain = await fetch_dex_new_pairs_all_chains()
-    posted_count = 0
-    for chain, pairs in pairs_by_chain.items():
-        for p in pairs:
-            key = dex_pair_key(chain, p)
+async def process_coingecko_momentum():
+    posted = 0
+    try:
+        loop = asyncio.get_running_loop()
+        coins = await loop.run_in_executor(None, fetch_coingecko_markets)
+        candidates = []
+        for coin in coins:
+            key = cg_coin_key(coin)
             if key in POSTED_SET:
                 continue
-            liquidity = safe_get(p, "liquidity", "usd", default=0) or p.get("liquidityUsd") or 0
-            buys_h1 = safe_get(p, "txns", "h1", "buys", default=0)
-            if not (DEX_LIQUIDITY_MIN <= float(liquidity) <= DEX_LIQUIDITY_MAX):
+            vol = coin.get("total_volume", 0) or 0
+            market_cap = coin.get("market_cap", 0) or 0
+            p1 = coin.get("price_change_percentage_1h_in_currency") or 0
+            p24 = coin.get("price_change_percentage_24h_in_currency") or 0
+            if not (CG_VOLUME_MIN <= vol <= CG_VOLUME_MAX):
                 continue
-            if buys_h1 < DEX_MIN_BUYS_H1:
+            if (p24 < CG_MOMENTUM_24H_MIN) and (p1 < CG_MOMENTUM_1H_MIN):
                 continue
-            msg = format_dex_message(chain, p)
+            if market_cap > CG_MARKET_CAP_MAX:
+                continue
+            # score by max(p24,p1)
+            candidates.append((max(p24, p1), key, coin))
+        if not candidates:
+            return 0
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        # post up to 3 (backup)
+        for score, key, coin in candidates[:3]:
+            msg = format_cg_msg(coin)
             try:
                 await client.send_message(CHANNEL_ID, msg)
                 mark_posted(key)
-                posted_count += 1
+                posted += 1
             except Exception as e:
-                print(f"[{now_str()}] ❌ Failed to post dex pair {key}: {e}")
-            if posted_count >= 10:
-                break
-        await asyncio.sleep(0.5)
-    posted_counter[0] += posted_count
-
-async def process_coingecko(posted_counter):
-    loop = asyncio.get_running_loop()
-    coins = await loop.run_in_executor(None, fetch_coingecko_markets)
-    candidates = []
-    for coin in coins:
-        key = cg_coin_key(coin)
-        volume = coin.get("total_volume", 0) or 0
-        market_cap = coin.get("market_cap", 0) or 0
-        p1 = coin.get("price_change_percentage_1h_in_currency") or 0
-        p24 = coin.get("price_change_percentage_24h_in_currency") or 0
-        if not (CG_VOLUME_MIN <= volume <= CG_VOLUME_MAX):
-            continue
-        if key in POSTED_SET:
-            continue
-        if (p24 < CG_MOMENTUM_24H_MIN) and (p1 < CG_MOMENTUM_1H_MIN):
-            continue
-        if market_cap > CG_MARKET_CAP_MAX:
-            continue
-        candidates.append((coin, max(p24, p1)))
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    posted = 0
-    for coin, _score in candidates:
-        key = cg_coin_key(coin)
-        msg = format_cg_message(coin)
-        try:
-            await client.send_message(CHANNEL_ID, msg)
-            mark_posted(key)
-            posted += 1
-        except Exception as e:
-            print(f"[{now_str()}] ❌ Failed to post coingecko coin {key}: {e}")
-        if posted >= 7:
-            break
-    posted_counter[0] += posted
+                print(f"[{now_str()}] ❌ Failed to post CoinGecko coin {key}: {e}")
+        return posted
+    except Exception as e:
+        print(f"[{now_str()}] ❌ process_coingecko_momentum error: {e}")
+        return 0
 
 # -----------------------------
-# Combo scan loop
+# Combined scheduler
 # -----------------------------
 async def combo_scan_loop():
     while True:
-        posted_counter = [0]  # use list as mutable counter
         try:
             print(f"[{now_str()}] ⏱️ Combo scan started...")
-            await asyncio.gather(process_dexscreener(posted_counter), process_coingecko(posted_counter))
-            if posted_counter[0] == 0:
-                await client.send_message(CHANNEL_ID,
-                                          "❌ No new meme coins found with volume $100k–$200k and positive momentum.")
-            print(f"[{now_str()}] ✅ Combo scan completed. Posted {posted_counter[0]} coins.")
+            # run dex trending and cg momentum concurrently
+            dex_task = asyncio.create_task(process_dex_trending())
+            cg_task = asyncio.create_task(process_coingecko_momentum())
+            dex_posted, cg_posted = await asyncio.gather(dex_task, cg_task)
+            total = (dex_posted or 0) + (cg_posted or 0)
+            if total == 0:
+                # Only post the no-results message in public channel
+                try:
+                    await client.send_message(CHANNEL_ID, "❌ No new meme coins found with volume $100k–$200k and positive momentum.")
+                except Exception as e:
+                    print(f"[{now_str()}] ❌ Failed to post no-results message: {e}")
+            print(f"[{now_str()}] ✅ Combo scan completed. Posted {total} items.")
         except Exception as e:
             print(f"[{now_str()}] ❌ Combo scan error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 # -----------------------------
-# /signal manual trigger
+# Manual /signal
 # -----------------------------
 @client.on(events.NewMessage(pattern="/signal"))
 async def manual_trigger(event):
     try:
-        await event.reply("⏳ Manual combo scan started — running Dexscreener + CoinGecko...")
-        posted_counter = [0]
-        await asyncio.gather(process_dexscreener(posted_counter), process_coingecko(posted_counter))
-        if posted_counter[0] == 0:
+        await event.reply("⏳ Manual combo scan started — running Dexscreener (trending) + CoinGecko...")
+        dex_posted, cg_posted = await asyncio.gather(process_dex_trending(), process_coingecko_momentum())
+        total = (dex_posted or 0) + (cg_posted or 0)
+        if total == 0:
             await event.reply("❌ No new meme coins found with volume $100k–$200k and positive momentum.")
         else:
-            await event.reply(f"✅ Manual scan completed. Posted {posted_counter[0]} coins.")
+            await event.reply(f"✅ Manual scan completed. Posted {total} items.")
     except Exception as e:
         await event.reply(f"❌ Manual scan error: {e}")
 
@@ -318,6 +393,7 @@ async def manual_trigger(event):
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     print(f"[{now_str()}] ✅ Combo Meme Coin Scanner is live")
+    # start background scanner
     asyncio.create_task(combo_scan_loop())
     await client.run_until_disconnected()
 
